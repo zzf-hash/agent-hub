@@ -1,0 +1,14 @@
+# Agent Hub 配置
+port: 8100
+
+# 鉴权 (留空则不鉴权，生产环境建议设置)
+auth_token: ""
+
+# 数据库路径
+db_path: "./db.sqlite"
+
+# 消息保留天数 (超过自动清理，0=不清理)
+message_retention_days: 30
+
+# 日志级别: debug / info / warn / error
+log_level: info

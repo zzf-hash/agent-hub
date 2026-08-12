@@ -1,0 +1,16 @@
+{
+  "name": "agent-hub",
+  "version": "1.0.0",
+  "description": "通用多Agent通信中间件 - MCP Server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "better-sqlite3": "^11.0.0",
+    "cors": "^2.8.5",
+    "uuid": "^9.0.1"
+  }
+}
