@@ -2,7 +2,7 @@
 port: 8100
 
 # 鉴权 (留空则不鉴权，生产环境建议设置)
-auth_token: ""
+auth_token: "87778ca73be1c09589a822e19eb30c07aab167f4195f5cd590dae11877144853"
 
 # 数据库路径
 db_path: "./db.sqlite"

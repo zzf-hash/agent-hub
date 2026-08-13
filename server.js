@@ -1,15 +1,13 @@
 /**
- * Agent Hub - 通用多Agent通信中间件
+ * Agent Hub v2 - 多Agent协作工作流中间件
  * 
- * 设计原则:
- * 1. 动态注册 - 任何agent随时上线/下线/替换
- * 2. 多项目隔离 - project字段隔离不同项目的消息和任务
- * 3. 角色自由 - role是自由文本，不写死
- * 4. 能力声明 - agent声明capabilities，PM据此分配任务
- * 
- * 两种接入方式:
- * A) MCP Client (Hermes等): 直接调用HTTP API
- * B) 轮询Agent: 定时调 get_messages / get_tasks
+ * v2 新增:
+ * 1. 任务状态机 (pending→in_progress→in_review→approved/rejected→testing→done)
+ * 2. 任务依赖 (parent_id, depends_on)
+ * 3. 审批流 (review_task, split_task)
+ * 4. 编排引擎 (自动触发测试/修复)
+ * 5. task_events 审计日志
+ * 6. 角色权限
  */
 
 const express = require('express');
@@ -44,6 +42,7 @@ function log(level, msg, data) {
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
+// v1 表（兼容已有数据）
 db.exec(`
   CREATE TABLE IF NOT EXISTS agents (
     id          TEXT PRIMARY KEY,
@@ -84,21 +83,102 @@ db.exec(`
     updated_at    TEXT DEFAULT (datetime('now')),
     completed_at  TEXT
   );
+`);
 
+// v2 迁移：给 tasks 表加新字段（ALTER TABLE ADD COLUMN 幂等性靠 catch）
+const newColumns = [
+  'parent_id TEXT DEFAULT NULL',
+  'depends_on TEXT DEFAULT NULL',
+  'task_type TEXT DEFAULT "dev"',
+  'review_status TEXT DEFAULT NULL',
+  'reviewer_id TEXT DEFAULT NULL',
+  'review_comment TEXT DEFAULT NULL',
+  'reviewed_at TEXT DEFAULT NULL',
+  'retry_of TEXT DEFAULT NULL',
+  'retry_count INTEGER DEFAULT 0',
+  'epic_id TEXT DEFAULT NULL'
+];
+
+for (const col of newColumns) {
+  const colName = col.split(' ')[0];
+  try {
+    db.exec(`ALTER TABLE tasks ADD COLUMN ${col}`);
+    log('info', `Migration: added column ${colName} to tasks`);
+  } catch (e) {
+    // 列已存在，跳过
+  }
+}
+
+// v2 新表：task_events（审计日志）
+db.exec(`
+  CREATE TABLE IF NOT EXISTS task_events (
+    id          TEXT PRIMARY KEY,
+    task_id     TEXT NOT NULL,
+    event       TEXT NOT NULL,
+    from_status TEXT,
+    to_status   TEXT,
+    actor_id    TEXT,
+    actor_name  TEXT,
+    comment     TEXT DEFAULT '',
+    created_at  TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id);
+  CREATE INDEX IF NOT EXISTS idx_events_project ON task_events(task_id);
+`);
+
+// v2 新表：epics（需求/大任务，PM拆解的根）
+db.exec(`
+  CREATE TABLE IF NOT EXISTS epics (
+    id          TEXT PRIMARY KEY,
+    project     TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    status      TEXT DEFAULT 'open',
+    created_by  TEXT,
+    created_at  TEXT DEFAULT (datetime('now')),
+    updated_at  TEXT DEFAULT (datetime('now'))
+  );
+`);
+
+db.exec(`
   CREATE INDEX IF NOT EXISTS idx_msg_project ON messages(project);
   CREATE INDEX IF NOT EXISTS idx_msg_to_role ON messages(to_role);
   CREATE INDEX IF NOT EXISTS idx_msg_to_id ON messages(to_id);
   CREATE INDEX IF NOT EXISTS idx_task_project ON tasks(project);
   CREATE INDEX IF NOT EXISTS idx_task_assigned ON tasks(assigned_role);
+  CREATE INDEX IF NOT EXISTS idx_task_parent ON tasks(parent_id);
+  CREATE INDEX IF NOT EXISTS idx_task_epic ON tasks(epic_id);
+  CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status);
   CREATE INDEX IF NOT EXISTS idx_agents_project ON agents(project);
 `);
 
 // ---------- 工具函数 ----------
-function now() {
-  return new Date().toISOString();
+function now() { return new Date().toISOString(); }
+
+// ---------- 状态机 ----------
+const VALID_TRANSITIONS = {
+  'pending':      ['in_progress', 'cancelled'],
+  'in_progress':  ['in_review', 'cancelled'],
+  'in_review':    ['approved', 'rejected', 'in_progress'], // rejected 可打回重做
+  'rejected':     ['in_progress', 'cancelled'],            // 修复中
+  'approved':     ['testing', 'completed'],                // 直接到completed(无需测试的任务)
+  'testing':      ['test_passed', 'test_failed'],
+  'test_passed':  ['completed'],
+  'test_failed':  ['in_progress'],                          // 回到开发修复
+  'completed':    [],
+  'cancelled':    []
+};
+
+// 终态
+const TERMINAL_STATES = ['completed', 'cancelled'];
+
+function canTransition(from, to) {
+  const allowed = VALID_TRANSITIONS[from];
+  if (!allowed) return false;
+  return allowed.includes(to);
 }
 
-// 鉴权中间件
+// ---------- 鉴权 ----------
 function authMiddleware(req, res, next) {
   if (!AUTH_TOKEN) return next();
   const token = req.headers['x-auth-token'] || req.query.token;
@@ -108,12 +188,164 @@ function authMiddleware(req, res, next) {
   next();
 }
 
-// 统一响应
-function ok(data) {
-  return { code: 0, data };
+// ---------- 角色权限 ----------
+const ROLE_PERMISSIONS = {
+  'manager': ['assign_task', 'review_task', 'split_task', 'create_epic', 'update_task', 'delete_task'],
+  'backend': ['update_task', 'send_message', 'get_messages', 'get_tasks'],
+  'frontend': ['update_task', 'send_message', 'get_messages', 'get_tasks'],
+  'qa': ['update_task', 'get_tasks', 'send_message', 'get_messages'],
+};
+
+function getAgentRole(agentId) {
+  const agent = db.prepare(`SELECT role FROM agents WHERE id = ?`).get(agentId);
+  return agent ? agent.role : null;
 }
-function fail(msg, code = 1) {
-  return { code, error: msg };
+
+function hasPermission(agentId, action) {
+  const role = getAgentRole(agentId);
+  if (!role) return false;
+  const perms = ROLE_PERMISSIONS[role];
+  if (!perms) return true; // 未知角色默认放开（向后兼容）
+  return perms.includes(action);
+}
+
+// ---------- 统一响应 ----------
+function ok(data) { return { code: 0, data }; }
+function fail(msg, code = 1) { return { code, error: msg }; }
+
+// ---------- 事件记录 ----------
+function logEvent(taskId, event, fromStatus, toStatus, actorId, actorName, comment) {
+  db.prepare(
+    `INSERT INTO task_events (id, task_id, event, from_status, to_status, actor_id, actor_name, comment)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(uuidv4(), taskId, event, fromStatus || null, toStatus || null, actorId || null, actorName || null, comment || '');
+}
+
+// ---------- 系统消息通知 ----------
+function notifyAgent(agentId, project, content) {
+  if (!agentId) return;
+  db.prepare(
+    `INSERT INTO messages (id, project, from_id, from_name, to_id, content)
+     VALUES (?, ?, 'system', 'AgentHub', ?, ?)`
+  ).run(uuidv4(), project, agentId, content);
+}
+
+function notifyRole(role, project, content) {
+  const agents = db.prepare(
+    `SELECT id FROM agents WHERE project = ? AND role = ? AND status = 'online'`
+  ).all(project, role);
+  for (const a of agents) {
+    notifyAgent(a.id, project, content);
+  }
+  if (agents.length === 0) {
+    // 存一条悬空消息，等该角色上线时能看到（虽然 get_messages 按 to_id 查，所以也存一条 to_role 的）
+    db.prepare(
+      `INSERT INTO messages (id, project, from_id, from_name, to_role, content)
+       VALUES (?, ?, 'system', 'AgentHub', ?, ?)`
+    ).run(uuidv4(), project, role, content);
+  }
+}
+
+// ---------- 编排引擎 ----------
+// 当任务状态变更时，检查是否需要自动触发后续动作
+function orchestrate(taskId, newStatus, actorId) {
+  const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId);
+  if (!task) return;
+
+  // 场景1: 一个开发任务变成 approved，检查同 epic 下是否所有子任务都 approved
+  if (newStatus === 'approved' && task.epic_id) {
+    const siblings = db.prepare(
+      `SELECT * FROM tasks WHERE epic_id = ? AND id != ? AND task_type = 'dev'`
+    ).all(task.epic_id, taskId);
+
+    const allApproved = siblings.every(s => s.status === 'approved' || s.status === 'completed' || s.status === 'testing' || s.status === 'test_passed');
+    
+    // 如果有同 epic 的其他 dev 任务都 approved/completed 了，检查是否已有测试任务
+    if (allApproved && siblings.length > 0) {
+      // 检查是否已存在测试任务
+      const existingTest = db.prepare(
+        `SELECT id FROM tasks WHERE epic_id = ? AND task_type = 'test' AND status NOT IN ('completed', 'cancelled')`
+      ).get(task.epic_id);
+
+      if (!existingTest) {
+        // 自动创建测试任务
+        const epic = db.prepare(`SELECT * FROM epics WHERE id = ?`).get(task.epic_id);
+        if (epic) {
+          const testTaskId = uuidv4();
+          db.prepare(
+            `INSERT INTO tasks (id, project, title, description, assigned_role, status, priority, created_by, task_type, epic_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 'qa', 'testing', ?, ?, 'test', ?, ?, ?)`
+          ).run(
+            testTaskId, task.project,
+            `[测试] ${epic.title}`,
+            `自动生成的测试任务。\n原始需求: ${epic.description || epic.title}`,
+            task.priority,
+            actorId || task.created_by,
+            task.epic_id,
+            now(), now()
+          );
+
+          logEvent(testTaskId, 'auto_created', null, 'testing', 'system', 'AgentHub-Orchestrator', `Epic ${task.epic_id} 所有开发任务已审核通过，自动创建测试任务`);
+
+          // 通知 QA
+          notifyRole('qa', task.project, `🧪 新测试任务: [测试] ${epic.title}`);
+          
+          // 通知 PM
+          notifyRole('manager', task.project, `✅ Epic "${epic.title}" 所有开发任务审核通过，已自动派发测试任务`);
+
+          log('info', `Orchestrate: auto-created test task for epic ${task.epic_id}`, { test_task_id: testTaskId });
+        }
+      }
+    }
+  }
+
+  // 场景2: 测试失败，自动生成修复任务
+  if (newStatus === 'test_failed' && task.task_type === 'test') {
+    // 找到同 epic 下的原开发任务，生成修复版本
+    const epic = db.prepare(`SELECT * FROM epics WHERE id = ?`).get(task.epic_id);
+    if (epic) {
+      const devTasks = db.prepare(
+        `SELECT * FROM tasks WHERE epic_id = ? AND task_type = 'dev'`
+      ).all(task.epic_id);
+
+      for (const devTask of devTasks) {
+        const fixTaskId = uuidv4();
+        db.prepare(
+          `INSERT INTO tasks (id, project, title, description, assigned_role, status, priority, created_by, task_type, epic_id, retry_of, retry_count, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, 'dev', ?, ?, ?, ?, ?)`
+        ).run(
+          fixTaskId, task.project,
+          `[修复] ${devTask.title}`,
+          `测试失败，需要修复。\n测试结果: ${task.result || '未提供详情'}\n原始任务: ${devTask.title}`,
+          devTask.assigned_role,
+          'urgent',
+          actorId || task.created_by,
+          task.epic_id,
+          devTask.id,
+          (devTask.retry_count || 0) + 1,
+          now(), now()
+        );
+
+        logEvent(fixTaskId, 'auto_created_fiX', null, 'pending', 'system', 'AgentHub-Orchestrator', `测试失败自动生成修复任务，源任务: ${devTask.id}`);
+        notifyRole(devTask.assigned_role, task.project, `🐛 修复任务: [修复] ${devTask.title} (测试失败)`);
+      }
+
+      notifyRole('manager', task.project, `❌ Epic "${epic.title}" 测试失败，已自动生成 ${devTasks.length} 个修复任务`);
+      log('info', `Orchestrate: auto-created ${devTasks.length} fix tasks for epic ${task.epic_id}`);
+    }
+  }
+
+  // 场景3: 测试通过，通知 PM
+  if (newStatus === 'test_passed' && task.task_type === 'test') {
+    const epic = db.prepare(`SELECT * FROM epics WHERE id = ?`).get(task.epic_id);
+    if (epic) {
+      notifyRole('manager', task.project, `🎉 Epic "${epic.title}" 测试通过！可以推进下一步了`);
+      // 把同 epic 的所有 dev 任务也标记为 completed
+      db.prepare(
+        `UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ? WHERE epic_id = ? AND task_type = 'dev' AND status != 'completed'`
+      ).run(now(), now(), task.epic_id);
+    }
+  }
 }
 
 // ---------- MCP 工具定义 ----------
@@ -124,92 +356,158 @@ const MCP_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: 'Agent名称，如"后端Hermes"' },
-        role: { type: 'string', description: '角色，自由文本，如 manager/frontend/backend/qa' },
-        project: { type: 'string', description: '项目名，如 yiyuan/kaiyan/mangersystem' },
-        capabilities: { type: 'string', description: '能力声明，逗号分隔，如 "Node.js,API,数据库"' }
+        name: { type: 'string', description: 'Agent名称' },
+        role: { type: 'string', description: '角色: manager/frontend/backend/qa 等' },
+        project: { type: 'string', description: '项目名' },
+        capabilities: { type: 'string', description: '能力声明，逗号分隔' }
       },
       required: ['name', 'role', 'project']
     }
   },
   {
     name: 'send_message',
-    description: '发送消息给指定agent(按id)或角色(按role)。同project内路由。',
+    description: '发送消息给指定agent(按id)或角色(按role)。',
     inputSchema: {
       type: 'object',
       properties: {
-        from_id: { type: 'string', description: '发送者agent_id' },
-        to_id: { type: 'string', description: '接收者agent_id（与to_role二选一）' },
-        to_role: { type: 'string', description: '接收角色（与to_id二选一，发给该角色所有在线agent）' },
-        content: { type: 'string', description: '消息内容' }
+        from_id: { type: 'string' },
+        to_id: { type: 'string' },
+        to_role: { type: 'string' },
+        content: { type: 'string' }
       },
       required: ['content']
     }
   },
   {
     name: 'get_messages',
-    description: '获取自己的未读消息。自动按project隔离。',
+    description: '获取自己的未读消息。读取即标记已读。',
     inputSchema: {
       type: 'object',
       properties: {
-        from_id: { type: 'string', description: '自己的agent_id' },
-        all: { type: 'boolean', description: 'true=包含已读消息，默认false只看未读' }
+        from_id: { type: 'string' },
+        all: { type: 'boolean', description: 'true=包含已读' }
       },
       required: ['from_id']
     }
   },
   {
     name: 'assign_task',
-    description: '创建并分配任务给指定角色或agent。',
+    description: '创建并分配任务。PM创建需求时可指定epic_id关联一组子任务。',
     inputSchema: {
       type: 'object',
       properties: {
-        created_by: { type: 'string', description: '创建者agent_id' },
-        project: { type: 'string', description: '项目名' },
-        title: { type: 'string', description: '任务标题' },
-        description: { type: 'string', description: '任务详细描述' },
-        to_role: { type: 'string', description: '分配给哪个角色' },
-        to_id: { type: 'string', description: '分配给指定agent（与to_role二选一）' },
-        priority: { type: 'string', description: '优先级: urgent/high/normal/low，默认normal' }
+        created_by: { type: 'string' },
+        project: { type: 'string' },
+        title: { type: 'string' },
+        description: { type: 'string' },
+        to_role: { type: 'string' },
+        to_id: { type: 'string' },
+        priority: { type: 'string', description: 'urgent/high/normal/low' },
+        epic_id: { type: 'string', description: '关联的Epic ID（PM拆解时用）' },
+        task_type: { type: 'string', description: 'dev(开发)/test(测试)/fix(修复)，默认dev' },
+        depends_on: { type: 'string', description: '依赖的任务ID，逗号分隔' }
       },
       required: ['project', 'title']
     }
   },
   {
     name: 'get_tasks',
-    description: '查询任务。可按项目、角色、状态过滤。agent查分配给自己角色的任务。',
+    description: '查询任务。可按项目、角色、状态、epic过滤。',
     inputSchema: {
       type: 'object',
       properties: {
         project: { type: 'string' },
-        status: { type: 'string', description: 'pending/in_progress/completed/cancelled' },
-        assigned_role: { type: 'string', description: '按角色查' },
-        assigned_id: { type: 'string', description: '按agent查' }
+        status: { type: 'string', description: 'pending/in_progress/in_review/approved/rejected/testing/test_passed/test_failed/completed/cancelled' },
+        assigned_role: { type: 'string' },
+        assigned_id: { type: 'string' },
+        epic_id: { type: 'string' }
       }
     }
   },
   {
     name: 'update_task',
-    description: '更新任务状态和结果。',
+    description: '更新任务状态。状态机校验：pending→in_progress→in_review→approved/rejected→testing→test_passed/test_failed→completed',
     inputSchema: {
       type: 'object',
       properties: {
-        task_id: { type: 'string', description: '任务ID' },
+        task_id: { type: 'string' },
         from_id: { type: 'string', description: '操作者agent_id' },
-        status: { type: 'string', description: 'pending/in_progress/completed/cancelled' },
+        status: { type: 'string' },
         result: { type: 'string', description: '任务结果/备注' }
       },
       required: ['task_id', 'status']
     }
   },
   {
-    name: 'list_agents',
-    description: '查看当前在线的agent列表。可按project过滤。',
+    name: 'review_task',
+    description: '【PM专用】审核任务。approve=审核通过，reject=打回重做。审核通过后若同epic所有dev任务都通过，自动创建测试任务。',
     inputSchema: {
       type: 'object',
       properties: {
-        project: { type: 'string', description: '按项目过滤' },
-        online_only: { type: 'boolean', description: 'true=只看在线的，默认true' }
+        task_id: { type: 'string' },
+        reviewer_id: { type: 'string', description: '审核者agent_id（必须是manager角色）' },
+        decision: { type: 'string', enum: ['approve', 'reject'], description: 'approve或reject' },
+        comment: { type: 'string', description: '审核意见' }
+      },
+      required: ['task_id', 'reviewer_id', 'decision']
+    }
+  },
+  {
+    name: 'split_task',
+    description: '【PM专用】将一个大任务拆解为子任务。自动创建epic并关联所有子任务。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string' },
+        title: { type: 'string', description: 'Epic标题' },
+        description: { type: 'string', description: '需求描述' },
+        created_by: { type: 'string', description: 'PM的agent_id' },
+        subtasks: { type: 'array', description: '子任务列表', items: {
+          type: 'object',
+          properties: {
+            title: { type: 'string' },
+            description: { type: 'string' },
+            to_role: { type: 'string', description: 'frontend/backend/qa' },
+            priority: { type: 'string' }
+          }
+        }}
+      },
+      required: ['project', 'title', 'subtasks']
+    }
+  },
+  {
+    name: 'create_epic',
+    description: '【PM专用】创建一个需求/Epic，后续可拆解为子任务关联。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string' },
+        title: { type: 'string' },
+        description: { type: 'string' },
+        created_by: { type: 'string' }
+      },
+      required: ['project', 'title']
+    }
+  },
+  {
+    name: 'get_task_events',
+    description: '获取任务的状态流转历史（审计日志）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string' }
+      },
+      required: ['task_id']
+    }
+  },
+  {
+    name: 'list_agents',
+    description: '查看在线agent列表。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string' },
+        online_only: { type: 'boolean' }
       }
     }
   },
@@ -219,14 +517,14 @@ const MCP_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        from_id: { type: 'string', description: '要下线的agent_id' }
+        from_id: { type: 'string' }
       },
       required: ['from_id']
     }
   },
   {
     name: 'heartbeat',
-    description: '心跳保活。agent定期调用更新last_seen。超过5分钟未心跳自动标记offline。',
+    description: '心跳保活。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -242,7 +540,6 @@ const tools = {
   register({ name, role, project, capabilities = '' }) {
     const id = uuidv4();
     
-    // 同project+role的旧agent下线
     const oldAgents = db.prepare(
       `SELECT id FROM agents WHERE project = ? AND role = ? AND status = 'online'`
     ).all(project, role);
@@ -257,7 +554,6 @@ const tools = {
        VALUES (?, ?, ?, ?, ?, 'online', ?, ?)`
     ).run(id, name, role, project, capabilities, now(), now());
 
-    // 转移未读消息给新agent
     for (const old of oldAgents) {
       db.prepare(
         `UPDATE messages SET to_id = ? WHERE to_id = ? AND is_read = 0`
@@ -282,7 +578,6 @@ const tools = {
     const msgId = uuidv4();
 
     if (to_id) {
-      // 发给指定agent
       const recv = db.prepare(`SELECT project FROM agents WHERE id = ?`).get(to_id);
       if (!recv) return fail('接收者不存在');
       project = project || recv.project;
@@ -291,13 +586,11 @@ const tools = {
          VALUES (?, ?, ?, ?, ?, ?)`
       ).run(msgId, project, from_id || 'system', fromName || 'System', to_id, content);
     } else {
-      // 发给角色下所有在线agent
       const recipients = db.prepare(
         `SELECT id, project FROM agents WHERE role = ? AND status = 'online' AND project = ?`
       ).all(to_role, project || '%');
       
       if (recipients.length === 0) {
-        // 没有在线agent也存一条，标记to_role
         db.prepare(
           `INSERT INTO messages (id, project, from_id, from_name, to_role, content)
            VALUES (?, ?, ?, ?, ?, ?)`
@@ -332,17 +625,20 @@ const tools = {
       ).all(from_id);
     }
 
-    // 标记为已读
     db.prepare(`UPDATE messages SET is_read = 1 WHERE to_id = ? AND is_read = 0`).run(from_id);
-
     return { messages: rows };
   },
 
-  assign_task({ created_by, project, title, description = '', to_role, to_id, priority = 'normal' }) {
+  assign_task({ created_by, project, title, description = '', to_role, to_id, priority = 'normal', epic_id, task_type = 'dev', depends_on }) {
+    // v2: 权限检查（assign_task 只允许 manager）
+    // 但向后兼容：如果没传 created_by，跳过权限检查（老调用方式）
+    if (created_by && !hasPermission(created_by, 'assign_task')) {
+      return fail('权限不足：只有 manager 角色可以分配任务');
+    }
+
     const taskId = uuidv4();
     let assignedId = to_id || null;
 
-    // 如果指定to_role但没指定to_id，找到该角色在线agent
     if (!assignedId && to_role) {
       const agent = db.prepare(
         `SELECT id FROM agents WHERE project = ? AND role = ? AND status = 'online' LIMIT 1`
@@ -351,24 +647,20 @@ const tools = {
     }
 
     db.prepare(
-      `INSERT INTO tasks (id, project, title, description, assigned_role, assigned_id, status, priority, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`
-    ).run(taskId, project, title, description, to_role || null, assignedId, priority, created_by || null, now(), now());
+      `INSERT INTO tasks (id, project, title, description, assigned_role, assigned_id, status, priority, created_by, task_type, epic_id, depends_on, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`
+    ).run(taskId, project, title, description, to_role || null, assignedId, priority, created_by || null, task_type, epic_id || null, depends_on || null, now(), now());
 
-    // 给被分配的agent发一条消息通知
     if (assignedId) {
-      const msgId = uuidv4();
-      db.prepare(
-        `INSERT INTO messages (id, project, from_id, from_name, to_id, content)
-         VALUES (?, ?, 'system', 'AgentHub', ?, ?)`
-      ).run(msgId, project, assignedId, `📋 新任务: ${title}`);
+      notifyAgent(assignedId, project, `📋 新任务: ${title}`);
     }
 
-    log('info', `Task assigned`, { task_id: taskId, project, to_role });
+    logEvent(taskId, 'created', null, 'pending', created_by, null, title);
+    log('info', `Task assigned`, { task_id: taskId, project, to_role, task_type });
     return { task_id: taskId };
   },
 
-  get_tasks({ project, status, assigned_role, assigned_id }) {
+  get_tasks({ project, status, assigned_role, assigned_id, epic_id }) {
     let sql = `SELECT * FROM tasks WHERE 1=1`;
     const params = [];
 
@@ -376,9 +668,9 @@ const tools = {
     if (status) { sql += ` AND status = ?`; params.push(status); }
     if (assigned_role) { sql += ` AND assigned_role = ?`; params.push(assigned_role); }
     if (assigned_id) { sql += ` AND assigned_id = ?`; params.push(assigned_id); }
+    if (epic_id) { sql += ` AND epic_id = ?`; params.push(epic_id); }
 
     sql += ` ORDER BY created_at DESC LIMIT 200`;
-
     const rows = db.prepare(sql).all(...params);
     return { tasks: rows };
   },
@@ -386,6 +678,11 @@ const tools = {
   update_task({ task_id, from_id, status, result = '' }) {
     const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task_id);
     if (!task) return fail('任务不存在');
+
+    // v2: 状态机校验
+    if (!canTransition(task.status, status)) {
+      return fail(`状态流转不合法: ${task.status} → ${status}。允许的流转: ${(VALID_TRANSITIONS[task.status] || []).join(', ') || '终态，不可变更'}`);
+    }
 
     const updates = { status, updated_at: now() };
     if (status === 'completed') updates.completed_at = now();
@@ -402,17 +699,143 @@ const tools = {
       id: task_id
     });
 
-    // 通知创建者任务状态变更
-    if (task.created_by && from_id !== task.created_by) {
-      const msgId = uuidv4();
-      db.prepare(
-        `INSERT INTO messages (id, project, from_id, from_name, to_id, content)
-         VALUES (?, ?, 'system', 'AgentHub', ?, ?)`
-      ).run(msgId, task.project, task.created_by, `📦 任务状态更新: ${task.title} → ${status}${result ? ' | ' + result : ''}`);
+    // 获取操作者名称
+    let actorName = null;
+    if (from_id) {
+      const agent = db.prepare(`SELECT name FROM agents WHERE id = ?`).get(from_id);
+      if (agent) actorName = agent.name;
     }
 
-    log('info', `Task updated`, { task_id, status });
+    // 记录事件
+    logEvent(task_id, 'status_change', task.status, status, from_id, actorName, result);
+
+    // 通知创建者
+    if (task.created_by && from_id !== task.created_by) {
+      notifyAgent(task.created_by, task.project, `📦 任务状态: ${task.title} → ${status}${result ? ' | ' + result : ''}`);
+    }
+
+    log('info', `Task updated`, { task_id, from: task.status, to: status });
+
+    // v2: 编排引擎 - 触发自动动作
+    orchestrate(task_id, status, from_id);
+
     return ok({});
+  },
+
+  // v2 新增: 审核任务
+  review_task({ task_id, reviewer_id, decision, comment = '' }) {
+    const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task_id);
+    if (!task) return fail('任务不存在');
+
+    // 权限检查：只有 manager 可以审核
+    if (!hasPermission(reviewer_id, 'review_task')) {
+      return fail('权限不足：只有 manager 角色可以审核任务');
+    }
+
+    // 状态校验：只有 in_review 状态的任务可以审核
+    if (task.status !== 'in_review') {
+      return fail(`只有 in_review 状态的任务可以审核，当前状态: ${task.status}`);
+    }
+
+    const newStatus = decision === 'approve' ? 'approved' : 'rejected';
+    
+    // 获取审核者名称
+    const reviewer = db.prepare(`SELECT name FROM agents WHERE id = ?`).get(reviewer_id);
+    const reviewerName = reviewer ? reviewer.name : 'Unknown';
+
+    db.prepare(
+      `UPDATE tasks SET status = ?, review_status = ?, reviewer_id = ?, review_comment = ?, reviewed_at = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(newStatus, decision, reviewer_id, comment, now(), now(), task_id);
+
+    logEvent(task_id, decision === 'approve' ? 'approved' : 'rejected', task.status, newStatus, reviewer_id, reviewerName, comment);
+
+    // 通知任务执行者
+    if (task.assigned_id) {
+      const emoji = decision === 'approve' ? '✅' : '❌';
+      notifyAgent(task.assigned_id, task.project, 
+        `${emoji} 审核结果: ${task.title}\n审核人: ${reviewerName}\n结果: ${decision === 'approve' ? '通过' : '驳回'}${comment ? '\n意见: ' + comment : ''}`
+      );
+    }
+
+    log('info', `Task reviewed`, { task_id, decision, reviewer: reviewerName });
+
+    // 编排：审核通过时检查是否需要自动创建测试任务
+    if (decision === 'approve') {
+      orchestrate(task_id, 'approved', reviewer_id);
+    }
+
+    return ok({ task_id, new_status: newStatus });
+  },
+
+  // v2 新增: 拆解任务
+  split_task({ project, title, description = '', created_by, subtasks }) {
+    if (!subtasks || subtasks.length === 0) {
+      return fail('至少需要一个子任务');
+    }
+
+    // 权限检查
+    if (created_by && !hasPermission(created_by, 'split_task')) {
+      return fail('权限不足：只有 manager 角色可以拆解任务');
+    }
+
+    // 创建 Epic
+    const epicId = uuidv4();
+    db.prepare(
+      `INSERT INTO epics (id, project, title, description, status, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'open', ?, ?, ?)`
+    ).run(epicId, project, title, description, created_by || null, now(), now());
+
+    log('info', `Epic created`, { epic_id: epicId, title });
+
+    // 创建子任务
+    const taskIds = [];
+    for (const sub of subtasks) {
+      const taskId = uuidv4();
+      let assignedId = null;
+      
+      if (sub.to_role) {
+        const agent = db.prepare(
+          `SELECT id FROM agents WHERE project = ? AND role = ? AND status = 'online' LIMIT 1`
+        ).get(project, sub.to_role);
+        if (agent) assignedId = agent.id;
+      }
+
+      db.prepare(
+        `INSERT INTO tasks (id, project, title, description, assigned_role, assigned_id, status, priority, created_by, task_type, epic_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 'dev', ?, ?, ?)`
+      ).run(taskId, project, sub.title, sub.description || '', sub.to_role || null, assignedId, sub.priority || 'normal', created_by || null, epicId, now(), now());
+
+      if (assignedId) {
+        notifyAgent(assignedId, project, `📋 新任务: ${sub.title}`);
+      }
+
+      logEvent(taskId, 'created', null, 'pending', created_by, null, `Epic: ${title}`);
+      taskIds.push(taskId);
+    }
+
+    log('info', `Epic split into ${taskIds.length} subtasks`, { epic_id: epicId, tasks: taskIds });
+    return { epic_id: epicId, task_ids: taskIds };
+  },
+
+  // v2 新增: 创建 Epic
+  create_epic({ project, title, description = '', created_by }) {
+    const epicId = uuidv4();
+    db.prepare(
+      `INSERT INTO epics (id, project, title, description, status, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'open', ?, ?, ?)`
+    ).run(epicId, project, title, description, created_by || null, now(), now());
+
+    log('info', `Epic created`, { epic_id: epicId, title });
+    return { epic_id: epicId };
+  },
+
+  // v2 新增: 获取任务事件
+  get_task_events({ task_id }) {
+    const rows = db.prepare(
+      `SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at ASC`
+    ).all(task_id);
+    return { events: rows };
   },
 
   list_agents({ project, online_only = true }) {
@@ -454,9 +877,10 @@ app.get('/health', (req, res) => {
     agents: db.prepare(`SELECT COUNT(*) as c FROM agents WHERE status = 'online'`).get().c,
     messages: db.prepare(`SELECT COUNT(*) as c FROM messages`).get().c,
     tasks: db.prepare(`SELECT COUNT(*) as c FROM tasks`).get().c,
+    epics: db.prepare(`SELECT COUNT(*) as c FROM epics`).get().c,
     projects: db.prepare(`SELECT COUNT(DISTINCT project) as c FROM agents WHERE status = 'online'`).get().c
   };
-  res.json(ok({ status: 'running', uptime: process.uptime(), ...counts }));
+  res.json(ok({ status: 'running', version: '2.0.0', uptime: process.uptime(), ...counts }));
 });
 
 // MCP 协议: 列出工具
@@ -522,6 +946,55 @@ app.put('/api/tasks/:task_id', authMiddleware, (req, res) => {
   catch (err) { res.status(500).json(fail(err.message)); }
 });
 
+// v2 新增路由: 审核任务
+app.post('/api/tasks/:task_id/review', authMiddleware, (req, res) => {
+  try {
+    const result = tools.review_task({
+      task_id: req.params.task_id,
+      ...req.body
+    });
+    res.json(result.error ? result : ok(result));
+  }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// v2 新增路由: 拆解任务
+app.post('/api/tasks/split', authMiddleware, (req, res) => {
+  try {
+    const result = tools.split_task(req.body);
+    res.json(result.error ? result : ok(result));
+  }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// v2 新增路由: 获取任务事件
+app.get('/api/tasks/:task_id/events', authMiddleware, (req, res) => {
+  try {
+    res.json(ok(tools.get_task_events({ task_id: req.params.task_id })));
+  }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// v2 新增路由: 创建 Epic
+app.post('/api/epics', authMiddleware, (req, res) => {
+  try { res.json(ok(tools.create_epic(req.body))); }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// v2 新增路由: 查询 Epics
+app.get('/api/epics', authMiddleware, (req, res) => {
+  try {
+    let sql = `SELECT * FROM epics WHERE 1=1`;
+    const params = [];
+    if (req.query.project) { sql += ` AND project = ?`; params.push(req.query.project); }
+    if (req.query.status) { sql += ` AND status = ?`; params.push(req.query.status); }
+    sql += ` ORDER BY created_at DESC`;
+    const rows = db.prepare(sql).all(...params);
+    res.json(ok({ epics: rows }));
+  }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
 app.get('/api/agents', authMiddleware, (req, res) => {
   try { res.json(ok(tools.list_agents(req.query))); }
   catch (err) { res.status(500).json(fail(err.message)); }
@@ -530,6 +1003,17 @@ app.get('/api/agents', authMiddleware, (req, res) => {
 app.post('/api/offline/:agent_id', authMiddleware, (req, res) => {
   try { res.json(ok(tools.offline({ from_id: req.params.agent_id }))); }
   catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// v2 新增: 心跳路由
+app.post('/api/heartbeat', authMiddleware, (req, res) => {
+  try { res.json(ok(tools.heartbeat(req.body))); }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// v2 新增: 状态机查询（给agent参考合法流转）
+app.get('/api/state-machine', authMiddleware, (req, res) => {
+  res.json(ok({ transitions: VALID_TRANSITIONS, terminal: TERMINAL_STATES }));
 });
 
 // ---------- 定时清理离线agent ----------
@@ -542,7 +1026,8 @@ setInterval(() => {
 
 // ---------- 启动 ----------
 app.listen(PORT, '0.0.0.0', () => {
-  log('info', `Agent Hub running on port ${PORT}`);
+  log('info', `Agent Hub v2.0.0 running on port ${PORT}`);
   log('info', `Health: http://localhost:${PORT}/health`);
   log('info', `MCP Tools: http://localhost:${PORT}/mcp/tools`);
+  log('info', `State Machine: http://localhost:${PORT}/api/state-machine`);
 });
