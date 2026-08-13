@@ -12,3 +12,8 @@ message_retention_days: 30
 
 # 日志级别: debug / info / warn / error
 log_level: info
+
+# Hermes webhook (审核结果转发到老板微信)
+# 注意：secret 是订阅级别的（每个 webhook subscribe 生成），不是 gateway 级别的
+hermes_webhook_url: "http://localhost:8644/webhooks/agenthub-task"
+hermes_webhook_secret: "aYCQPsHMLJeyg0TzlkIa2d07r2lnyW5ZFJNi3yZpCww"

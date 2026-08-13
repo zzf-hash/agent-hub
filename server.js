@@ -28,6 +28,8 @@ const PORT = parseInt(config.port) || 8100;
 const AUTH_TOKEN = config.auth_token || '';
 const DB_PATH = config.db_path || './db.sqlite';
 const LOG_LEVEL = config.log_level || 'info';
+const HERMES_WEBHOOK_URL = config.hermes_webhook_url || '';
+const HERMES_WEBHOOK_SECRET = config.hermes_webhook_secret || '';
 
 // ---------- 日志 ----------
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
@@ -159,9 +161,8 @@ function now() { return new Date().toISOString(); }
 const VALID_TRANSITIONS = {
   'pending':      ['in_progress', 'cancelled'],
   'in_progress':  ['in_review', 'cancelled'],
-  'in_review':    ['approved', 'rejected', 'in_progress'], // rejected 可打回重做
+  'in_review':    ['testing', 'rejected', 'in_progress'], // 审核通过直接进testing
   'rejected':     ['in_progress', 'cancelled'],            // 修复中
-  'approved':     ['testing', 'completed'],                // 直接到completed(无需测试的任务)
   'testing':      ['test_passed', 'test_failed'],
   'test_passed':  ['completed'],
   'test_failed':  ['in_progress'],                          // 回到开发修复
@@ -244,6 +245,63 @@ function notifyRole(role, project, content) {
        VALUES (?, ?, 'system', 'AgentHub', ?, ?)`
     ).run(uuidv4(), project, role, content);
   }
+}
+
+// ---------- 老板通知 (通过 Hermes webhook → 微信) ----------
+const http = require('http');
+const crypto = require('crypto');
+
+function notifyBoss(eventType, message) {
+  if (!HERMES_WEBHOOK_URL) {
+    log('warn', 'notifyBoss: HERMES_WEBHOOK_URL not configured, skip');
+    return;
+  }
+
+  // 必须用 agenthub.task 事件（订阅只监听这个）
+  // message 放到 task.description 里，这样 Hermes 会话能收到
+  const payload = JSON.stringify({
+    event_type: 'agenthub.task',
+    task: {
+      id: 'notify-' + Date.now(),
+      title: message.split('\n')[0] || '通知',
+      description: message,
+      priority: 'normal',
+      assigned_role: 'notify',
+      _notify_type: eventType
+    }
+  });
+
+  // 解析 URL
+  const urlObj = new URL(HERMES_WEBHOOK_URL);
+  const options = {
+    hostname: urlObj.hostname,
+    port: urlObj.port,
+    path: urlObj.pathname,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload)
+    }
+  };
+
+  // HMAC 签名（订阅级别 secret）
+  if (HERMES_WEBHOOK_SECRET) {
+    const sig = crypto.createHmac('sha256', HERMES_WEBHOOK_SECRET).update(payload).digest('hex');
+    options.headers['X-Hub-Signature-256'] = `sha256=${sig}`;
+  }
+
+  const req = http.request(options, (res) => {
+    let body = '';
+    res.on('data', c => body += c);
+    res.on('end', () => {
+      log('info', `notifyBoss webhook: ${res.statusCode} ${body.slice(0, 100)}`);
+    });
+  });
+  req.on('error', (e) => {
+    log('error', `notifyBoss webhook failed: ${e.message}`);
+  });
+  req.write(payload);
+  req.end();
 }
 
 // ---------- 编排引擎 ----------
@@ -331,15 +389,17 @@ function orchestrate(taskId, newStatus, actorId) {
       }
 
       notifyRole('manager', task.project, `❌ Epic "${epic.title}" 测试失败，已自动生成 ${devTasks.length} 个修复任务`);
+      notifyBoss('agenthub.test', `❌ 测试失败\n\n📋 需求: ${epic.title}\n📝 原因: ${task.result || '未说明'}\n→ 已自动生成 ${devTasks.length} 个修复任务，打回开发`);
       log('info', `Orchestrate: auto-created ${devTasks.length} fix tasks for epic ${task.epic_id}`);
     }
   }
 
-  // 场景3: 测试通过，通知 PM
+  // 场景3: 测试通过，通知 PM + 老板
   if (newStatus === 'test_passed' && task.task_type === 'test') {
     const epic = db.prepare(`SELECT * FROM epics WHERE id = ?`).get(task.epic_id);
     if (epic) {
       notifyRole('manager', task.project, `🎉 Epic "${epic.title}" 测试通过！可以推进下一步了`);
+      notifyBoss('agenthub.test', `🎉 测试通过\n\n📋 需求: ${epic.title}\n→ 全部子任务完成，可以推进下一阶段`);
       // 把同 epic 的所有 dev 任务也标记为 completed
       db.prepare(
         `UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ? WHERE epic_id = ? AND task_type = 'dev' AND status != 'completed'`
@@ -737,7 +797,8 @@ const tools = {
       return fail(`只有 in_review 状态的任务可以审核，当前状态: ${task.status}`);
     }
 
-    const newStatus = decision === 'approve' ? 'approved' : 'rejected';
+    // 审核通过→直接进testing（跳过approved），驳回→rejected
+    const newStatus = decision === 'approve' ? 'testing' : 'rejected';
     
     // 获取审核者名称
     const reviewer = db.prepare(`SELECT name FROM agents WHERE id = ?`).get(reviewer_id);
@@ -754,14 +815,21 @@ const tools = {
     if (task.assigned_id) {
       const emoji = decision === 'approve' ? '✅' : '❌';
       notifyAgent(task.assigned_id, task.project, 
-        `${emoji} 审核结果: ${task.title}\n审核人: ${reviewerName}\n结果: ${decision === 'approve' ? '通过' : '驳回'}${comment ? '\n意见: ' + comment : ''}`
+        `${emoji} 审核结果: ${task.title}\n审核人: ${reviewerName}\n结果: ${decision === 'approve' ? '通过，进入测试' : '驳回'}${comment ? '\n意见: ' + comment : ''}`
       );
     }
+
+    // 审核结果发老板微信
+    const bossMsg = decision === 'approve'
+      ? `✅ 审核通过\n\n📋 任务: ${task.title}\n👤 审核人: ${reviewerName}\n📝 意见: ${comment || '无'}\n→ 已自动进入测试阶段`
+      : `❌ 审核驳回\n\n📋 任务: ${task.title}\n👤 审核人: ${reviewerName}\n📝 驳回原因: ${comment || '未说明'}\n→ 已打回重做`;
+    notifyBoss('agenthub.review', bossMsg);
 
     log('info', `Task reviewed`, { task_id, decision, reviewer: reviewerName });
 
     // 编排：审核通过时检查是否需要自动创建测试任务
     if (decision === 'approve') {
+      // 因为直接进 testing，手动触发编排（检查同epic其他任务）
       orchestrate(task_id, 'approved', reviewer_id);
     }
 
