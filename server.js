@@ -222,13 +222,75 @@ function logEvent(taskId, event, fromStatus, toStatus, actorId, actorName, comme
   ).run(uuidv4(), taskId, event, fromStatus || null, toStatus || null, actorId || null, actorName || null, comment || '');
 }
 
+// ---------- [Phase1] 实时推送基础设施（长轮询 + SSE） ----------
+// 设计说明：
+//   - 事件总线 hubEvents 承载两类事件：
+//       EVT_MESSAGE: 新消息落库后触发（含系统通知），唤醒长轮询 + 推送SSE
+//       EVT_TASK:    任务创建/状态变化后触发，推送SSE
+//   - 不改数据库表结构，不改现有API请求/响应格式，纯增量。
+const EventEmitter = require('events');
+const hubEvents = new EventEmitter();
+hubEvents.setMaxListeners(0); // SSE/长轮询并发连接数不定，解除监听器数量告警限制
+
+const EVT_MESSAGE = 'hub:message';
+const EVT_TASK = 'hub:task';
+
+// SSE 连接注册表：agent_id -> Set<client>（同一agent允许多连接）
+const sseClients = new Map();
+
+// 消息落库后调用：唤醒该收件人挂起的长轮询，并推送其SSE连接
+function emitNewMessage(toId, payload) {
+  if (!toId) return;
+  hubEvents.emit(EVT_MESSAGE, { to_id: toId, message: payload || null });
+}
+
+// 任务创建/状态变化后调用：推送给关注该任务的SSE连接
+function emitTaskEvent(type, taskRow) {
+  if (!taskRow) return;
+  hubEvents.emit(EVT_TASK, { type, task: taskRow });
+}
+
+// 向单个SSE客户端写事件（写失败由 close 处理器兜底清理，这里只吞异常）
+function sseSend(client, eventName, data) {
+  try {
+    client.res.write(`event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`);
+  } catch (e) {
+    log('debug', `SSE write failed (will be cleaned on close)`, { error: e.message });
+  }
+}
+
+// 关闭指定agent的全部SSE连接（agent显式下线/被替换/心跳超时时调用，防泄漏）
+function closeSseForAgent(agentId) {
+  const set = sseClients.get(agentId);
+  if (!set) return;
+  for (const client of set) {
+    if (client.pingTimer) clearInterval(client.pingTimer);
+    try { client.res.end(); } catch (e) { /* 已断开则忽略 */ }
+  }
+  sseClients.delete(agentId);
+  log('debug', `SSE: closed all connections for agent`, { agent_id: agentId, count: set.size });
+}
+
+// [Phase1] 长轮询辅助：取未读 / 标记已读（与 tools.get_messages 行为一致）
+function fetchUnreadMessages(agentId) {
+  return db.prepare(
+    `SELECT * FROM messages WHERE to_id = ? AND is_read = 0 ORDER BY created_at ASC LIMIT 100`
+  ).all(agentId);
+}
+function markMessagesRead(agentId) {
+  db.prepare(`UPDATE messages SET is_read = 1 WHERE to_id = ? AND is_read = 0`).run(agentId);
+}
+
 // ---------- 系统消息通知 ----------
 function notifyAgent(agentId, project, content) {
   if (!agentId) return;
+  const msgId = uuidv4();
   db.prepare(
     `INSERT INTO messages (id, project, from_id, from_name, to_id, content)
      VALUES (?, ?, 'system', 'AgentHub', ?, ?)`
-  ).run(uuidv4(), project, agentId, content);
+  ).run(msgId, project, agentId, content);
+  // [Phase1] 唤醒该agent的长轮询 + 推送SSE
+  emitNewMessage(agentId, { id: msgId, project, from_id: 'system', from_name: 'AgentHub', to_id: agentId, content });
 }
 
 function notifyRole(role, project, content) {
@@ -618,6 +680,8 @@ const tools = {
       db.prepare(
         `UPDATE messages SET to_id = ? WHERE to_id = ? AND is_read = 0`
       ).run(id, old.id);
+      // [Phase1] 旧agent实例被替换，关闭其全部SSE连接（连接方需用新agent_id重连）
+      closeSseForAgent(old.id);
     }
 
     log('info', `Agent registered`, { id, name, role, project });
@@ -645,6 +709,8 @@ const tools = {
         `INSERT INTO messages (id, project, from_id, from_name, to_id, content)
          VALUES (?, ?, ?, ?, ?, ?)`
       ).run(msgId, project, from_id || 'system', fromName || 'System', to_id, content);
+      // [Phase1] 唤醒收件人长轮询 + 推送SSE
+      emitNewMessage(to_id, { id: msgId, project, from_id: from_id || 'system', from_name: fromName || 'System', to_id, content });
     } else {
       const recipients = db.prepare(
         `SELECT id, project FROM agents WHERE role = ? AND status = 'online' AND project = ?`
@@ -655,6 +721,7 @@ const tools = {
           `INSERT INTO messages (id, project, from_id, from_name, to_role, content)
            VALUES (?, ?, ?, ?, ?, ?)`
         ).run(msgId, project || 'unknown', from_id || 'system', fromName || 'System', to_role, content);
+        // [Phase1] to_role 悬空消息无具体收件人，不触发长轮询/SSE（等该角色上线拉取）
       } else {
         for (const r of recipients) {
           const mid = recipients.indexOf(r) === 0 ? msgId : uuidv4();
@@ -662,6 +729,8 @@ const tools = {
             `INSERT INTO messages (id, project, from_id, from_name, to_id, to_role, content)
              VALUES (?, ?, ?, ?, ?, ?, ?)`
           ).run(mid, r.project, from_id || 'system', fromName || 'System', r.id, to_role, content);
+          // [Phase1] 唤醒每个在线收件人
+          emitNewMessage(r.id, { id: mid, project: r.project, from_id: from_id || 'system', from_name: fromName || 'System', to_id: r.id, to_role, content });
         }
       }
     }
@@ -717,6 +786,11 @@ const tools = {
 
     logEvent(taskId, 'created', null, 'pending', created_by, null, title);
     log('info', `Task assigned`, { task_id: taskId, project, to_role, task_type });
+    // [Phase1] SSE 推送新任务事件（给 assignee / 该角色 / 全部在线连接）
+    emitTaskEvent('task_created', {
+      id: taskId, project, title, assigned_role: to_role || null,
+      assigned_id: assignedId, status: 'pending', priority
+    });
     return { task_id: taskId };
   },
 
@@ -776,6 +850,13 @@ const tools = {
 
     log('info', `Task updated`, { task_id, from: task.status, to: status });
 
+    // [Phase1] SSE 推送任务状态变化
+    emitTaskEvent('task_status_changed', {
+      id: task_id, project: task.project, title: task.title,
+      assigned_role: task.assigned_role, assigned_id: task.assigned_id,
+      from_status: task.status, to_status: status
+    });
+
     // v2: 编排引擎 - 触发自动动作
     orchestrate(task_id, status, from_id);
 
@@ -826,6 +907,14 @@ const tools = {
     notifyBoss('agenthub.review', bossMsg);
 
     log('info', `Task reviewed`, { task_id, decision, reviewer: reviewerName });
+
+    // [Phase1] SSE 推送审核结果（任务状态已变为 testing/rejected）
+    emitTaskEvent('task_reviewed', {
+      id: task_id, project: task.project, title: task.title,
+      assigned_role: task.assigned_role, assigned_id: task.assigned_id,
+      decision, comment,
+      from_status: task.status, to_status: newStatus
+    });
 
     // 编排：审核通过时检查是否需要自动创建测试任务
     if (decision === 'approve') {
@@ -879,6 +968,11 @@ const tools = {
       }
 
       logEvent(taskId, 'created', null, 'pending', created_by, null, `Epic: ${title}`);
+      // [Phase1] SSE 推送子任务创建
+      emitTaskEvent('task_created', {
+        id: taskId, project, title: sub.title, assigned_role: sub.to_role || null,
+        assigned_id: assignedId, status: 'pending', priority: sub.priority || 'normal', epic_id: epicId
+      });
       taskIds.push(taskId);
     }
 
@@ -922,6 +1016,8 @@ const tools = {
   offline({ from_id }) {
     db.prepare(`UPDATE agents SET status = 'offline', offline_at = ? WHERE id = ?`)
       .run(now(), from_id);
+    // [Phase1] agent下线，关闭其全部SSE连接（防泄漏）
+    closeSseForAgent(from_id);
     log('info', `Agent offline`, { id: from_id });
     return ok({});
   },
@@ -990,11 +1086,135 @@ app.post('/api/send_message', authMiddleware, (req, res) => {
   catch (err) { res.status(500).json(fail(err.message)); }
 });
 
+// [Phase1] GET /api/messages/:agent_id
+//   不带 wait 参数 → 行为与改造前完全一致（立即返回，读取即标记已读）
+//   带 wait=<秒>   → 长轮询：有未读立即返回；无未读挂起最多 wait 秒，
+//                    期间有新消息到达立即唤醒返回；超时返回空列表。
+//                    挂起期间不标记已读；返回前统一标记（与旧行为一致）。
 app.get('/api/messages/:agent_id', authMiddleware, (req, res) => {
   try {
-    res.json(ok(tools.get_messages({ from_id: req.params.agent_id, all: req.query.all === 'true' })));
+    const agentId = req.params.agent_id;
+    const all = req.query.all === 'true';
+
+    // 向后兼容：无 wait 参数，走原有同步逻辑
+    const waitRaw = parseFloat(req.query.wait);
+    if (!waitRaw || !(waitRaw > 0)) {
+      return res.json(ok(tools.get_messages({ from_id: agentId, all })));
+    }
+
+    // [Phase1] 长轮询分支
+    const agent = db.prepare(`SELECT project, role FROM agents WHERE id = ?`).get(agentId);
+    if (!agent) return res.status(400).json(fail('agent不存在，请先register'));
+
+    // 上限 60 秒，防客户端传超大值长期占用连接
+    const waitSec = Math.min(waitRaw, 60);
+
+    // 挂起期间有新消息到达时被调用
+    const onMessage = (evt) => {
+      if (evt.to_id !== agentId) return;
+      finish();
+    };
+
+    let finished = false;
+    const cleanupAndRespond = () => {
+      const rows = fetchUnreadMessages(agentId);
+      if (rows.length > 0) markMessagesRead(agentId);
+      res.json(ok({ messages: rows }));
+    };
+
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      hubEvents.removeListener(EVT_MESSAGE, onMessage);
+      cleanupAndRespond();
+    };
+
+    // 超时兜底
+    const timer = setTimeout(finish, waitSec * 1000);
+    // 客户端提前断开时清理监听器，防止泄漏
+    res.on('close', () => {
+      if (!finished) {
+        finished = true;
+        clearTimeout(timer);
+        hubEvents.removeListener(EVT_MESSAGE, onMessage);
+      }
+    });
+
+    // 先查一次已有未读（有则立即返回，不挂起）
+    const existing = fetchUnreadMessages(agentId);
+    if (existing.length > 0) {
+      markMessagesRead(agentId);
+      finished = true;
+      clearTimeout(timer);
+      return res.json(ok({ messages: existing }));
+    }
+
+    // 无未读 → 挂起等待新消息事件
+    hubEvents.on(EVT_MESSAGE, onMessage);
   }
   catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// [Phase1] GET /api/stream/:agent_id — SSE 实时推送端点
+//   响应 Content-Type: text/event-stream。
+//   有新消息/新任务/任务状态变化时推 event: message，data 为 JSON：
+//     { type: 'message' | 'task_created' | 'task_status_changed' | 'task_reviewed', ... }
+//   心跳：每 20 秒推一行 :ping 注释保持连接。
+//   客户端断开时必须清理（监听器 + 定时器 + 注册表），防内存泄漏。
+app.get('/api/stream/:agent_id', authMiddleware, (req, res) => {
+  const agentId = req.params.agent_id;
+  const agent = db.prepare(`SELECT id FROM agents WHERE id = ?`).get(agentId);
+  if (!agent) return res.status(400).json(fail('agent不存在，请先register'));
+
+  // SSE 响应头（禁用 nginx 等反代缓冲由部署侧处理，这里先 flush 头）
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.write(':connected\n\n');
+
+  const client = { res, agentId };
+
+  // 注册到连接表（同 agent 多连接允许）
+  let set = sseClients.get(agentId);
+  if (!set) { set = new Set(); sseClients.set(agentId, set); }
+  set.add(client);
+
+  // 新消息 → 推给该 agent 的所有连接
+  const onMessage = (evt) => {
+    if (evt.to_id !== agentId) return;
+    sseSend(client, 'message', { type: 'message', message: evt.message });
+  };
+  // 任务事件 → 推给所有已连接 agent（Phase1 简化路由：任务事件全局广播，
+  // 客户端可按 assigned_role/assigned_id 自行过滤）
+  const onTask = (evt) => {
+    sseSend(client, 'message', { type: evt.type, task: evt.task });
+  };
+  hubEvents.on(EVT_MESSAGE, onMessage);
+  hubEvents.on(EVT_TASK, onTask);
+
+  // 心跳：每 20 秒推一行注释，保持连接不被中间层掐断
+  client.pingTimer = setInterval(() => {
+    try { res.write(':ping\n\n'); } catch (e) { /* ignore */ }
+  }, 20 * 1000);
+
+  // 客户端断开 / PM2 重启连接断开 → 全量清理，防泄漏
+  res.on('close', () => {
+    clearInterval(client.pingTimer);
+    hubEvents.removeListener(EVT_MESSAGE, onMessage);
+    hubEvents.removeListener(EVT_TASK, onTask);
+    const s = sseClients.get(agentId);
+    if (s) {
+      s.delete(client);
+      if (s.size === 0) sseClients.delete(agentId);
+    }
+    log('debug', `SSE client disconnected`, { agent_id: agentId, remaining: s ? s.size : 0 });
+  });
+
+  log('debug', `SSE client connected`, { agent_id: agentId, total_agents_streaming: sseClients.size });
 });
 
 app.post('/api/tasks', authMiddleware, (req, res) => {
@@ -1087,6 +1307,12 @@ app.get('/api/state-machine', authMiddleware, (req, res) => {
 // ---------- 定时清理离线agent ----------
 setInterval(() => {
   const cutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  // [Phase1] 找出心跳超时的agent，关闭其SSE连接（防泄漏）
+  const stale = db.prepare(
+    `SELECT id FROM agents WHERE status = 'online' AND last_seen < ?`
+  ).all(cutoff);
+  for (const a of stale) closeSseForAgent(a.id);
+
   db.prepare(`UPDATE agents SET status = 'offline', offline_at = ? WHERE status = 'online' AND last_seen < ?`)
     .run(now(), cutoff);
   log('debug', 'Heartbeat check completed');
