@@ -1235,11 +1235,19 @@ app.put('/api/tasks/:task_id', authMiddleware, (req, res) => {
 });
 
 // v2 新增路由: 审核任务
+// B8 修3: 兼容两种审核入参——
+//   形式A: {decision: "approve"|"reject", reviewer_id, comment}
+//   形式B: {approve: true|false, reviewer_id, comment}（PM 实际使用，2026-08-14 复现）
+// 此前只认 decision 字段，approve:true 被忽略 → decision=undefined → 永远 rejected
 app.post('/api/tasks/:task_id/review', authMiddleware, (req, res) => {
   try {
+    const body = { ...req.body };
+    if (body.decision === undefined && body.approve !== undefined) {
+      body.decision = body.approve === true || body.approve === 'true' ? 'approve' : 'reject';
+    }
     const result = tools.review_task({
       task_id: req.params.task_id,
-      ...req.body
+      ...body
     });
     res.json(result.error ? result : ok(result));
   }
