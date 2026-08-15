@@ -4,3 +4,5 @@ db.sqlite-journal
 db.sqlite-wal
 db.sqlite-shm
 public/*.msi
+agent_hub.db
+*.db
