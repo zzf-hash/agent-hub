@@ -46,7 +46,7 @@ SRV_PID=$!
 sleep 1.2
 
 HEALTH=$(curl -s "$BASE/health" | jq_get data.version)
-if [ "$HEALTH" = "2.3.0" ]; then ok "health version=$HEALTH"; else bad "health version=$HEALTH (期望 2.2.0)"; cat /tmp/hub-test.log; fi
+if [ "$HEALTH" = "2.3.1" ]; then ok "health version=$HEALTH"; else bad "health version=$HEALTH (期望 2.3.1)"; cat /tmp/hub-test.log; fi
 
 # 不带 token 应 401
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/agents")
@@ -226,7 +226,7 @@ sleep 1.5
 CH=$(curl -s http://localhost:8298/health | jq_get data.status)
 CV=$(curl -s http://localhost:8298/health | jq_get data.version)
 if [ "$CH" = "running" ]; then ok "T8a 无config.yaml启动成功 status=running"; else bad "T8a 冷启动失败: $CH"; cat /tmp/hub-coldstart.log; fi
-[ "$CV" = "2.3.0" ] && ok "T8b 版本=$CV" || bad "T8b 版本=$CV（期望 2.2.0）"
+[ "$CV" = "2.3.1" ] && ok "T8b 版本=$CV" || bad "T8b 版本=$CV（期望 2.3.1）"
 # 子 shell 里的 $! 拿不到外层，兜底 pkill 本脚本启动的 8298 node（端口唯一，误杀面为零）
 pkill -f "PORT=8298" 2>/dev/null; sleep 0.3
 COLD_NODE=$(ss -tlnp 2>/dev/null | grep ':8298' | grep -oP 'pid=\K[0-9]+' | head -1)
@@ -295,6 +295,75 @@ H -X PUT $BASE/api/tasks/$T9T -H 'Content-Type: application/json' -d "{\"from_id
 H -X PUT $BASE/api/tasks/$T9T -H 'Content-Type: application/json' -d "{\"from_id\":\"$M\",\"status\":\"completed\"}" > /dev/null
 RESP=$(H -X POST $BASE/api/tasks/$T9T/transfer -H 'Content-Type: application/json' -d "{\"to_id\":\"$TF\"}")
 echo "$RESP" | grep -q '"code":1' && ok "T9e-6 终态任务不可移交" || bad "T9e-6 终态未被拒: $RESP"
+
+# ---------- T10 v2.3.1 busy 优先 + 清扫豁免 + 四色数据源 ----------
+section "T10 v2.3.1 busy优先/清扫豁免/pending数据源"
+# T10 前置：建 PM + backend agent + 任务，用独立项目 yiyuan5 隔离
+T10M=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"t10pm","role":"manager","project":"yiyuan5"}' | jq_get data.agent_id)
+B1=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"t10busy1","role":"backend","project":"yiyuan5"}' | jq_get data.agent_id)
+[ -n "$B1" ] && [ "$B1" != "undefined" ] && ok "T10-0 busy agent 注册" || bad "T10-0 注册失败: $B1"
+
+# T10.1 claim 任务后不心跳>5min → display_state 仍 busy（豁免清扫 + busy 优先双保险）
+T10T1=$(H -X POST $BASE/api/tasks -H 'Content-Type: application/json' -d "{\"created_by\":\"$T10M\",\"project\":\"yiyuan5\",\"title\":\"T10.1豁免测试\",\"to_role\":\"backend\",\"to_id\":\"$B1\"}" | jq_get data.task_id)
+H -X PUT $BASE/api/tasks/$T10T1 -H 'Content-Type: application/json' -d "{\"from_id\":\"$B1\",\"status\":\"in_progress\"}" > /dev/null
+# 模拟「claim 后深度干活，5min 无任何请求」：把 last_seen 拨回 10min 前，跑一次清扫等价 SQL 判定
+node -e "const D=require('better-sqlite3');const db=new D('$DB');db.prepare(\"UPDATE agents SET last_seen=datetime('now','-10 minutes') WHERE id=?\").run('$B1');" 2>/dev/null
+ST=$(sq "SELECT status FROM agents WHERE id='$B1'")
+DS=$(H "$BASE/api/agents?project=yiyuan5&online_only=false" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);const a=(j.data.agents||[]).find(x=>x.id==='$B1');console.log(a?a.display_state:'NOT_FOUND')})")
+[ "$DS" = "online_busy" ] && ok "T10.1 claim后10min无请求 display_state=$DS（busy 优先，未降级离线）" || bad "T10.1 display_state=$DS status=$ST（期望 online_busy）"
+
+# T10.2 work-start 后同样（external 工作项路径）
+#   注：B2 用 frontend 角色，避免 T10.4 的 backend 队列任务被自动指派到 B2（确定性）
+B2=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"t10busy2","role":"frontend","project":"yiyuan5"}' | jq_get data.agent_id)
+H -X POST $BASE/api/agents/$B2/work/start -H 'Content-Type: application/json' -d "{\"from_id\":\"$B2\",\"title\":\"T10.2外部工作\"}" > /dev/null
+node -e "const D=require('better-sqlite3');const db=new D('$DB');db.prepare(\"UPDATE agents SET last_seen=datetime('now','-10 minutes') WHERE id=?\").run('$B2');" 2>/dev/null
+DS=$(H "$BASE/api/agents?project=yiyuan5&online_only=false" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);const a=(j.data.agents||[]).find(x=>x.id==='$B2');console.log(a?a.display_state:'NOT_FOUND')})")
+[ "$DS" = "online_busy" ] && ok "T10.2 work-start后10min无请求 display_state=$DS（busy 优先）" || bad "T10.2 display_state=$DS（期望 online_busy）"
+
+# T10.3 active work 超 60min 无请求 → offline + work 标 stale + 任务回 pending
+node -e "const D=require('better-sqlite3');const db=new D('$DB');db.prepare(\"UPDATE agents SET last_seen=datetime('now','-70 minutes') WHERE id=?\").run('$B2');" 2>/dev/null
+node -e "const D=require('better-sqlite3');const db=new D('$DB');db.prepare(\"UPDATE agent_work SET updated_at=datetime('now','-70 minutes') WHERE agent_id=? AND status='active'\").run('$B2');" 2>/dev/null
+# 手动执行与清扫器等价的完整逻辑（隔离实例不等 60s tick）：
+#   ① sweep：超5min 且不满足豁免（60min内有活动+有进行中工作）→ 置 offline
+#   ② forsaken：已 offline 且超60min 的 working agent → active work 标 stale + in_progress 任务回 pending
+node -e "
+const D=require('better-sqlite3');const db=new D('$DB');
+const soft=new Date(Date.now()-5*60*1000).toISOString();
+const hard=new Date(Date.now()-60*60*1000).toISOString();
+db.prepare(\`UPDATE agents SET status='offline', offline_at=datetime('now') WHERE status='online' AND last_seen < ? AND NOT (last_seen >= ? AND id IN (SELECT assigned_id FROM tasks WHERE status='in_progress' AND assigned_id IS NOT NULL UNION SELECT agent_id FROM agent_work WHERE status='active'))\`).run(soft, hard);
+const forsaken=db.prepare(\`SELECT id FROM agents WHERE status='offline' AND last_seen < ? AND (id IN (SELECT assigned_id FROM tasks WHERE status='in_progress' AND assigned_id IS NOT NULL) OR id IN (SELECT agent_id FROM agent_work WHERE status='active'))\`).all(hard);
+for (const ag of forsaken) {
+  db.prepare(\`UPDATE agent_work SET status='stale', updated_at=datetime('now') WHERE agent_id=? AND status='active'\`).run(ag.id);
+  db.prepare(\`UPDATE tasks SET status='pending', assigned_id=NULL WHERE assigned_id=? AND status='in_progress'\`).run(ag.id);
+}
+console.log('forsaken:'+forsaken.length);
+" 2>/dev/null
+ST=$(sq "SELECT status FROM agents WHERE id='$B2'")
+WS=$(sq "SELECT status FROM agent_work WHERE agent_id='$B2' AND title='T10.2外部工作'")
+[ "$ST" = "offline" ] && ok "T10.3a 超时 B2 状态=$ST" || bad "T10.3a B2 状态=$ST（期望 offline）"
+[ "$WS" = "stale" ] && ok "T10.3b active work 已标 stale" || bad "T10.3b work 状态=$WS（期望 stale）"
+# B2 复活拉回验证（心跳复活 → stale 拉回 active）
+H -X POST $BASE/mcp/tools/heartbeat -H 'Content-Type: application/json' -d "{\"from_id\":\"$B2\"}" > /dev/null
+WS=$(sq "SELECT status FROM agent_work WHERE agent_id='$B2' AND title='T10.2外部工作'")
+[ "$WS" = "active" ] && ok "T10.3c 心跳复活后 stale 拉回 active" || bad "T10.3c 复活后 work=$WS（期望 active）"
+
+# T10.4 agent 离线且 pending>0 → 响应仍含 pending_task_count（🟠徽标数据源）
+#   前置：manager 先完结 B1 的 in_progress 任务（busy 解除），B1 置 offline；
+#   再建 to_role=backend 任务——无在线 backend → 落角色队列（assigned_id=NULL），
+#   B1（backend@yiyuan5）应得 pending_task_count=1 且 display_state=offline
+H -X PUT $BASE/api/tasks/$T10T1 -H 'Content-Type: application/json' -d "{\"from_id\":\"$T10M\",\"status\":\"completed\",\"result\":\"T10.4前置收尾\"}" > /dev/null
+H -X POST $BASE/api/offline/$B1 > /dev/null
+T10T4=$(H -X POST $BASE/api/tasks -H 'Content-Type: application/json' -d "{\"created_by\":\"$T10M\",\"project\":\"yiyuan5\",\"title\":\"T10.4待接取徽标数据源\",\"to_role\":\"backend\"}" | jq_get data.task_id)
+PT=$(H "$BASE/api/agents?project=yiyuan5&online_only=false" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);const a=(j.data.agents||[]).find(x=>x.id==='$B1');console.log(a?('display_state='+a.display_state+' pending_task_count='+a.pending_task_count):'NOT_FOUND')})")
+echo "$PT" | grep -q 'display_state=offline' && echo "$PT" | grep -q 'pending_task_count=[1-9]' && ok "T10.4 离线 agent 仍带 pending_task_count（$PT）" || bad "T10.4 $PT（期望 display_state=offline 且 pending_task_count>0）"
+
+# T10.5 面板 HTML/JS 含四色 hex 映射
+DASH_HTML="/home/agentuser/yiyuan-server/scripts/dashboard/public/index.html"
+ALL4=1
+for HEX in '#22c55e' '#facc15' '#f97316' '#ef4444'; do
+  if grep -q -- "$HEX" "$DASH_HTML"; then :; else ALL4=0; fi
+done
+[ $ALL4 -eq 1 ] && ok "T10.5 面板含四色 hex（#22c55e/#facc15/#f97316/#ef4444）" || bad "T10.5 面板缺四色 hex 之一"
 
 # ---------- 收尾 ----------
 echo

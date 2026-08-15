@@ -825,9 +825,12 @@ const tools = {
       // [Phase1] 唤醒收件人长轮询 + 推送SSE
       emitNewMessage(to_id, { id: msgId, project, from_id: from_id || 'system', from_name: fromName || 'System', to_id, content });
     } else {
+      // v2.3.1（任务 3485f9b7）：收件人不再限定 status='online'——深度干活的 agent 会被 5min 清扫
+      //   误置 offline（或依赖清扫豁免保持 online），to_role 广播若只达 online 会漏达干活 agent。
+      //   改为排除 replaced 墓碑（终态不可投递），offline 但 60min 内活跃的 agent 照常投递。
       const recipients = db.prepare(
-        `SELECT id, project FROM agents WHERE role = ? AND status = 'online' AND project = ?`
-      ).all(to_role, project || '%');
+        `SELECT id, project FROM agents WHERE role = ? AND status != 'replaced' AND project = ? AND last_seen >= ?`
+      ).all(to_role, project || '%', new Date(Date.now() - 60 * 60 * 1000).toISOString());
       
       if (recipients.length === 0) {
         db.prepare(
@@ -1186,6 +1189,9 @@ const tools = {
     //   active_work_count / hub_active_count / external_active_count: 工作项视角（busy 派生用）
     //   pending_task_count: 直接指派待接取(pending+assigned_id) + 角色队列(assigned_id IS NULL 且 assigned_role 匹配)
     //   display_state: offline | online_idle | online_busy（replaced 行照常返回，display_state 置 'replaced'）
+    // v2.3.1（任务 3485f9b7）：busy 优先——存在进行中工作（in_progress hub 任务 或 agent_work active 项）
+    //   即显示 online_busy，不因 last_seen 超时被清扫置 offline 而降级显示「离线」。
+    //   超时失联（超60min被置 offline）后 active 工作项被标 stale、任务离开 in_progress，busy 自然解除。
     if (!online_only) {
       const activeMap = new Map();
       db.prepare(
@@ -1223,11 +1229,15 @@ const tools = {
         row.hub_active_count = hubActive;
         row.external_active_count = extActive;
         row.pending_task_count = pendingAssigned + pendingQueue;
+        // v2.3.1（任务 3485f9b7）：busy 优先判定——replaced > 有进行中工作(online_busy，即使 status 已被超时清扫置 offline) > 常规四态
+        const busy = activeWork > 0 || active > 0;
         row.display_state = row.status === 'replaced'
           ? 'replaced'
-          : row.status === 'online'
-            ? (activeWork > 0 ? 'online_busy' : 'online_idle')
-            : 'offline';
+          : busy
+            ? 'online_busy'
+            : row.status === 'online'
+              ? 'online_idle'
+              : 'offline';
       }
     }
     return { agents: rows };
@@ -1398,7 +1408,7 @@ app.get('/health', (req, res) => {
     epics: db.prepare(`SELECT COUNT(*) as c FROM epics`).get().c,
     projects: db.prepare(`SELECT COUNT(DISTINCT project) as c FROM agents WHERE status = 'online'`).get().c
   };
-  res.json(ok({ status: 'running', version: '2.3.0', uptime: process.uptime(), ...counts }));
+  res.json(ok({ status: 'running', version: '2.3.1', uptime: process.uptime(), ...counts }));
 });
 
 // MCP 协议: 列出工具
@@ -1844,20 +1854,60 @@ app.get('/api/state-machine', authMiddleware, (req, res) => {
 
 // ---------- 定时清理离线agent ----------
 setInterval(() => {
-  const cutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  // v2.3.1（任务 3485f9b7）清扫豁免：agent 深度干活期间不发请求（不心跳/不轮询），
+  //   5min 窗口一刀切会把正在干活的 agent 误判离线（老板 2026-08-15 实测反馈根因）。
+  //   分层超时：有进行中工作的 agent 豁免 5min 清扫，60min 内有任何 API 活动就不置 offline；
+  //   超 60min 才置 offline，同时把其 active 工作项标 stale（面板灰显）并把 in_progress 任务放回 pending。
+  //   无进行中工作的 agent 维持 5min 现状。replaced 墓碑不参与豁免（终态不可逆）。
+  const softCutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  const hardCutoff = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+
   // [Phase1] 找出心跳超时的agent，关闭其SSE连接（防泄漏）
   const stale = db.prepare(
     `SELECT id FROM agents WHERE status = 'online' AND last_seen < ?`
-  ).all(cutoff);
+  ).all(softCutoff);
   for (const a of stale) closeSseForAgent(a.id);
 
-  // v2.1 身份机制：不碰 replaced 墓碑（终态），只把真超时的 online 置 offline
-  db.prepare(`UPDATE agents SET status = 'offline', offline_at = ? WHERE status = 'online' AND last_seen < ?`)
-    .run(now(), cutoff);
+  // v2.1 身份机制：不碰 replaced 墓碑（终态）。
+  // v2.3.1：有进行中工作且 60min 内有 API 活动 → 豁免（保持 online）；其余超 5min 照旧置 offline。
+  const sweep = db.prepare(
+    `UPDATE agents SET status = 'offline', offline_at = ?
+     WHERE status = 'online' AND last_seen < ?
+       AND NOT (last_seen >= ? AND id IN (SELECT assigned_id FROM tasks WHERE status = 'in_progress' AND assigned_id IS NOT NULL
+                    UNION SELECT agent_id FROM agent_work WHERE status = 'active'))`
+  ).run(now(), softCutoff, hardCutoff);
+  if (sweep.changes > 0) {
+    log('info', `sweeper: ${sweep.changes} agent(s) marked offline (busy agents with activity<60min exempted)`);
+  }
+
+  // v2.3.1：豁免失效（超60min无API活动）被置 offline 的 working agent——
+  //   ① active 工作项标 stale（面板灰显，复用 v2.3 stale 概念）
+  //   ② 其 in_progress 任务放回 pending（assigned_id 清空，角色队列可重新接取）
+  //      同时关掉对应 hub 工作项（防 stale 项永久挂着），放回的任务被重新认领会生成新工作项。
+  const forsaken = db.prepare(
+    `SELECT id FROM agents WHERE status = 'offline' AND last_seen < ?
+       AND (id IN (SELECT assigned_id FROM tasks WHERE status = 'in_progress' AND assigned_id IS NOT NULL)
+            OR id IN (SELECT agent_id FROM agent_work WHERE status = 'active'))`
+  ).all(hardCutoff);
+  for (const ag of forsaken) {
+    const dropped = db.prepare(
+      `UPDATE agent_work SET status = 'stale', updated_at = ? WHERE agent_id = ? AND status = 'active'`
+    ).run(now(), ag.id);
+    const backToPending = db.prepare(
+      `UPDATE tasks SET status = 'pending', assigned_id = NULL, updated_at = ? WHERE assigned_id = ? AND status = 'in_progress'`
+    ).run(now(), ag.id);
+    if (dropped.changes > 0 || backToPending.changes > 0) {
+      log('info', `sweeper: working agent lost >60min → offline`, {
+        agent_id: ag.id, works_stale: dropped.changes, tasks_back_to_pending: backToPending.changes
+      });
+    }
+  }
 
   // v2.3 失联判定（任务 933e16a3，顺带处理不新建定时器）：
-  //   active 工作项 且所属 agent 已 offline 且 updated_at 超过30分钟 → 置 'stale'；
+  //   active 工作项 且所属 agent 已 offline/replaced 且 updated_at 超过30分钟 → 置 'stale'；
   //   该 agent 心跳复活或 update 上报时自动拉回 active（见 heartbeat / work_update / 拉消息路径）。
+  //   v2.3.1 注：上面的 60min 强制收尾已把 forsaken agent 的工作项即时置 stale（比30min窗口先手），
+  //   此条继续兜底其余 offline/replaced 场景（如手动 offline、替换移交后的旧身份残留项）。
   const workCutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
   const orphaned = db.prepare(
     `UPDATE agent_work SET status = 'stale', updated_at = ?
@@ -1874,7 +1924,7 @@ setInterval(() => {
 
 // ---------- 启动 ----------
 app.listen(PORT, '0.0.0.0', () => {
-  log('info', `Agent Hub v2.3.0 running on port ${PORT}`);
+  log('info', `Agent Hub v2.3.1 running on port ${PORT}`);
   log('info', `Health: http://localhost:${PORT}/health`);
   log('info', `MCP Tools: http://localhost:${PORT}/mcp/tools`);
   log('info', `State Machine: http://localhost:${PORT}/api/state-machine`);
