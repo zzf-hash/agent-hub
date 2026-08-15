@@ -13,6 +13,10 @@ npm start          # 或 pm2 start ecosystem.config.js
 
 默认端口 `8100`，修改 `config.yaml` 调整。
 
+> **冷启动**：`config.yaml` 不存在时自动回退 `config.example.yaml`，再回退空默认（端口 8100）。全新 clone 无需任何配置即可 `npm install && npm start` 起服务，真实配置用环境变量（`HUB_AUTH_TOKEN`/`HUB_DB`/`PORT`）或自建 `config.yaml` 覆盖。
+
+> **监控面板**：本仓库曾内置 `scripts/dashboard/` 副本，已移除。权威版本在 YIYUAN 仓库 `scripts/dashboard/`（server.js + public/index.html + test.sh + ecosystem.config.js），零依赖独立部署，PM2 进程名 `agenthub-dashboard`。
+
 ### Agent 接入（任何语言、任何框架）
 
 所有交互都是 HTTP REST，两种调用方式：

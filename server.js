@@ -17,7 +17,17 @@ const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 
 // 简单读取yaml配置
-const rawConfig = fs.readFileSync(__dirname + '/config.yaml', 'utf8');
+// v2.1.2 A2 冷启动修复：config.yaml 不存在时回退 config.example.yaml，再回退空默认。
+// 此前 fs.readFileSync(config.yaml) 硬依赖使新 clone 无法启动（env 覆盖在文件读取之后，救不了）。
+// env 优先级不变（PORT/HUB_AUTH_TOKEN/HUB_DB 等仍可覆盖一切文件值）。
+const CONFIG_FILES = ['config.yaml', 'config.example.yaml'];
+let rawConfig = '';
+for (const f of CONFIG_FILES) {
+  try {
+    rawConfig = fs.readFileSync(__dirname + '/' + f, 'utf8');
+    break;
+  } catch (e) { /* 尝试下一个回退文件 */ }
+}
 const config = {};
 rawConfig.split('\n').forEach(line => {
   const m = line.match(/^(\w+):\s*(.*)$/);
@@ -692,6 +702,16 @@ const tools = {
       db.prepare(
         `UPDATE messages SET to_id = ? WHERE to_id = ? AND is_read = 0`
       ).run(id, old.id);
+      // v2.1.2 A3 替换移交：旧身份持有的未终态任务（pending/in_progress/in_review/testing/rejected）
+      // 移交新 agent_id，避免换人后任务死锁（此前只有 manager 能解锁）。
+      // 只移交给同 project+role 的新身份（oldAgents 本身就是按 project+role 筛的，天然同构）。
+      const HANDOVER_STATES = "('pending','in_progress','in_review','testing','rejected')";
+      const moved = db.prepare(
+        `UPDATE tasks SET assigned_id = ? WHERE assigned_id = ? AND status IN ${HANDOVER_STATES}`
+      ).run(id, old.id);
+      if (moved.changes > 0) {
+        log('info', `Task handover on replace`, { from: old.id, to: id, count: moved.changes });
+      }
       // [Phase1] 旧agent实例被替换，关闭其全部SSE连接（连接方需用新agent_id重连）
       closeSseForAgent(old.id);
     }
@@ -1072,8 +1092,18 @@ const tools = {
   },
 
   offline({ from_id }) {
-    db.prepare(`UPDATE agents SET status = 'offline', offline_at = ? WHERE id = ?`)
-      .run(now(), from_id);
+    // v2.1.2 A1 旁路修复：offline 不得降级 replaced 墓碑——被替换身份若被置 offline，
+    // 可借轮询/心跳复活（2cfe52d 语义），等于绕过墓碑防线。只允许 online→offline。
+    const r = db.prepare(
+      `UPDATE agents SET status = 'offline', offline_at = ? WHERE id = ? AND status != 'replaced'`
+    ).run(now(), from_id);
+    if (r.changes === 0) {
+      const ag = db.prepare(`SELECT status FROM agents WHERE id = ?`).get(from_id);
+      if (ag && ag.status === 'replaced') {
+        log('warn', `offline rejected: agent is replaced (tombstone)`, { id: from_id });
+        return fail(`身份已被替换（replaced 终态），不可置 offline`);
+      }
+    }
     // [Phase1] agent下线，关闭其全部SSE连接（防泄漏）
     closeSseForAgent(from_id);
     log('info', `Agent offline`, { id: from_id });
@@ -1109,7 +1139,7 @@ app.get('/health', (req, res) => {
     epics: db.prepare(`SELECT COUNT(*) as c FROM epics`).get().c,
     projects: db.prepare(`SELECT COUNT(DISTINCT project) as c FROM agents WHERE status = 'online'`).get().c
   };
-  res.json(ok({ status: 'running', version: '2.1.1', uptime: process.uptime(), ...counts }));
+  res.json(ok({ status: 'running', version: '2.1.2', uptime: process.uptime(), ...counts }));
 });
 
 // MCP 协议: 列出工具

@@ -20,6 +20,14 @@ ok()   { echo "  ✔ $1"; PASS=$((PASS+1)); }
 bad()  { echo "  ✘ $1"; FAIL=$((FAIL+1)); }
 section(){ echo; echo "=== $1 ==="; }
 
+# A4: trap 清理——脚本任何退出路径（含中断/断言失败）都杀掉隔离实例进程、清理 /tmp 残留
+SRV_PID=""
+cleanup() {
+  [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
+  rm -f "$DB" "$DB-wal" "$DB-shm" /tmp/hub-test.log /tmp/hub-coldstart.log 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
 # node 版 sqlite3 查询助手（替代 sqlite3 CLI）：输出裸值（字符串不带引号）
 sq() { node -e "
 const D=require('better-sqlite3');
@@ -38,7 +46,7 @@ SRV_PID=$!
 sleep 1.2
 
 HEALTH=$(curl -s "$BASE/health" | jq_get data.version)
-if [ "$HEALTH" = "2.1.0" ]; then ok "health version=$HEALTH"; else bad "health version=$HEALTH (期望 2.1.0)"; cat /tmp/hub-test.log; fi
+if [ "$HEALTH" = "2.1.2" ]; then ok "health version=$HEALTH"; else bad "health version=$HEALTH (期望 2.1.2)"; cat /tmp/hub-test.log; fi
 
 # 不带 token 应 401
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/agents")
@@ -160,10 +168,66 @@ NST=$(sq "SELECT status FROM tasks WHERE id='$RT'")
 CODE=$(H -o /dev/null -w '%{http_code}' "$BASE/api/messages/$F?wait=1")
 [ "$CODE" = "200" ] && ok "T5g 长轮询端点可用" || bad "T5g 长轮询返回$CODE"
 
+# ---------- T6 offline 旁路修复（v2.1.2 A1）----------
+section "T6 offline 不得降级 replaced 墓碑"
+# X 已在 T1 被 Y 替换为 replaced；对其调 offline（tools.offline 与 POST /api/offline/:id 同路径）
+RESP=$(H -X POST $BASE/api/offline/$X)
+ST=$(sq "SELECT status FROM agents WHERE id='$X'")
+if [ "$ST" = "replaced" ]; then ok "T6a X被替换后调offline仍 replaced"; else bad "T6a offline把墓碑降级成 $ST（旁路复活漏洞！）"; fi
+echo "$RESP" | grep -q '不可置 offline\|replaced' && ok "T6b offline返回拒绝提示" || bad "T6b offline响应无拒绝语义: $RESP"
+# 对照：online 身份 offline 仍正常（注：T2 里 Z 注册时顶掉了 Y，用新鲜注册的 online 身份验证）
+Z2=$(reg agentZ2 backend)
+RESP=$(H -X POST $BASE/api/offline/$Z2)
+ST=$(sq "SELECT status FROM agents WHERE id='$Z2'")
+[ "$ST" = "offline" ] && ok "T6c 正常online身份offline成功" || bad "T6c online身份offline失败: $ST resp=$RESP"
+
+# ---------- T7 替换移交（v2.1.2 A3）----------
+section "T7 同名重注册移交未终态任务"
+# F2 持任务 in_progress → 同名同角色重注册 F2' → 任务应移交 F2' 且 F2' 可直接流转
+T7TASK=$(H -X POST $BASE/api/tasks -H 'Content-Type: application/json' -d "{\"created_by\":\"$M\",\"project\":\"yiyuan3\",\"title\":\"T7移交测试\",\"to_role\":\"frontend\"}" | jq_get data.task_id)
+FH=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"frontHand","role":"frontend","project":"yiyuan3"}' | jq_get data.agent_id)
+H -X PUT $BASE/api/tasks/$T7TASK -H 'Content-Type: application/json' -d "{\"from_id\":\"$FH\",\"status\":\"in_progress\"}" > /dev/null
+AID=$(sq "SELECT assigned_id FROM tasks WHERE id='$T7TASK'")
+[ "$AID" = "$FH" ] && ok "T7a frontHand 持任务 in_progress" || bad "T7a 认领失败 assigned_id=$AID"
+# 同名重注册（模拟换会话）
+FH2=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"frontHand","role":"frontend","project":"yiyuan3"}' | jq_get data.agent_id)
+[ "$FH2" != "$FH" ] && [ -n "$FH2" ] && [ "$FH2" != "undefined" ] && ok "T7b 同名重注册得新身份" || bad "T7b 重注册失败: $FH2"
+AID=$(sq "SELECT assigned_id FROM tasks WHERE id='$T7TASK'")
+[ "$AID" = "$FH2" ] && ok "T7c 任务 assigned_id 已移交新身份" || bad "T7c 未移交 assigned_id=$AID（期望 $FH2）"
+# F2'（新身份）直接流转——不得因绑定旧身份被拒
+RESP=$(H -X PUT $BASE/api/tasks/$T7TASK -H 'Content-Type: application/json' -d "{\"from_id\":\"$FH2\",\"status\":\"in_review\"}")
+ST=$(sq "SELECT status FROM tasks WHERE id='$T7TASK'")
+if [ "$ST" = "in_review" ]; then ok "T7d 新身份可直接流转（无死锁）"; else bad "T7d 流转失败: $ST resp=$RESP"; fi
+# 终态任务不移交（回归保护）
+H -X PUT $BASE/api/tasks/$T7TASK -H 'Content-Type: application/json' -d "{\"from_id\":\"$M\",\"status\":\"testing\"}" > /dev/null
+H -X PUT $BASE/api/tasks/$T7TASK -H 'Content-Type: application/json' -d "{\"from_id\":\"$M\",\"status\":\"test_passed\"}" > /dev/null
+H -X PUT $BASE/api/tasks/$T7TASK -H 'Content-Type: application/json' -d "{\"from_id\":\"$M\",\"status\":\"completed\"}" > /dev/null
+FH3=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"frontHand","role":"frontend","project":"yiyuan3"}' | jq_get data.agent_id)
+AID=$(sq "SELECT assigned_id FROM tasks WHERE id='$T7TASK'")
+[ "$AID" = "$FH2" ] && ok "T7e 终态任务不被移交（completed保持原assignee）" || bad "T7e 终态任务被误移交: $AID"
+
+# ---------- T8 冷启动（v2.1.2 A2）----------
+section "T8 冷启动：无 config.yaml 可启动"
+COLD=$(mktemp -d /tmp/hub-coldstart.XXXXXX)
+# 复制最小运行集：server.js + node_modules 软链（不含 config.yaml / config.example.yaml，验证空默认兜底）
+cp "$DIR/server.js" "$COLD/"
+ln -s "$DIR/node_modules" "$COLD/node_modules"
+COLD_PID=""
+( cd "$COLD" && PORT=8298 HUB_DB="$COLD/cold.sqlite" HUB_AUTH_TOKEN="" node server.js > /tmp/hub-coldstart.log 2>&1 & COLD_PID=$!; echo $COLD_PID > /tmp/hub-coldstart.pid )
+sleep 1.5
+CH=$(curl -s http://localhost:8298/health | jq_get data.status)
+CV=$(curl -s http://localhost:8298/health | jq_get data.version)
+if [ "$CH" = "running" ]; then ok "T8a 无config.yaml启动成功 status=running"; else bad "T8a 冷启动失败: $CH"; cat /tmp/hub-coldstart.log; fi
+[ "$CV" = "2.1.2" ] && ok "T8b 版本=$CV" || bad "T8b 版本=$CV（期望 2.1.2）"
+# 子 shell 里的 $! 拿不到外层，兜底 pkill 本脚本启动的 8298 node（端口唯一，误杀面为零）
+pkill -f "PORT=8298" 2>/dev/null; sleep 0.3
+COLD_NODE=$(ss -tlnp 2>/dev/null | grep ':8298' | grep -oP 'pid=\K[0-9]+' | head -1)
+[ -z "$COLD_NODE" ] || kill "$COLD_NODE" 2>/dev/null
+rm -rf "$COLD" /tmp/hub-coldstart.pid
+
 # ---------- 收尾 ----------
 echo
 echo "================================"
 echo "结果: PASS=$PASS FAIL=$FAIL"
 echo "================================"
-kill $SRV_PID 2>/dev/null
 [ $FAIL -eq 0 ] && exit 0 || exit 1
