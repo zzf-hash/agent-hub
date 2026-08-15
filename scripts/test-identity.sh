@@ -46,7 +46,7 @@ SRV_PID=$!
 sleep 1.2
 
 HEALTH=$(curl -s "$BASE/health" | jq_get data.version)
-if [ "$HEALTH" = "2.2.0" ]; then ok "health version=$HEALTH"; else bad "health version=$HEALTH (期望 2.2.0)"; cat /tmp/hub-test.log; fi
+if [ "$HEALTH" = "2.3.0" ]; then ok "health version=$HEALTH"; else bad "health version=$HEALTH (期望 2.2.0)"; cat /tmp/hub-test.log; fi
 
 # 不带 token 应 401
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/agents")
@@ -226,7 +226,7 @@ sleep 1.5
 CH=$(curl -s http://localhost:8298/health | jq_get data.status)
 CV=$(curl -s http://localhost:8298/health | jq_get data.version)
 if [ "$CH" = "running" ]; then ok "T8a 无config.yaml启动成功 status=running"; else bad "T8a 冷启动失败: $CH"; cat /tmp/hub-coldstart.log; fi
-[ "$CV" = "2.2.0" ] && ok "T8b 版本=$CV" || bad "T8b 版本=$CV（期望 2.2.0）"
+[ "$CV" = "2.3.0" ] && ok "T8b 版本=$CV" || bad "T8b 版本=$CV（期望 2.2.0）"
 # 子 shell 里的 $! 拿不到外层，兜底 pkill 本脚本启动的 8298 node（端口唯一，误杀面为零）
 pkill -f "PORT=8298" 2>/dev/null; sleep 0.3
 COLD_NODE=$(ss -tlnp 2>/dev/null | grep ':8298' | grep -oP 'pid=\K[0-9]+' | head -1)
