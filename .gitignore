@@ -17,3 +17,6 @@ logs/
 server.js.*.bak
 .env*
 config.yaml
+
+__pycache__/
+*.pyc
