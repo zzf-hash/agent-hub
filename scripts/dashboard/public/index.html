@@ -31,6 +31,12 @@ h2{font-size:14px;color:var(--dim);margin:18px 0 10px;text-transform:uppercase;l
 .acard .role{color:var(--purple);font-size:12px}
 .acard .cap{color:var(--dim);font-size:12px;margin-top:4px;word-break:break-all}
 .acard .seen{color:var(--dimmer);font-size:12px;margin-top:4px}
+.acard.acard-off{opacity:.65}
+.st{font-size:11px;padding:1px 8px;border-radius:10px;flex:none;white-space:nowrap;margin-left:2px}
+.st-busy{background:#3d2f00;color:var(--yellow)}
+.st-idle{background:#1a3325;color:var(--green)}
+.st-off{background:#3d1e1e;color:var(--red)}
+.busy-tasks{color:var(--yellow);font-size:12px;margin-top:4px;word-break:break-all}
 .tabs{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap}
 .tab{background:var(--panel);border:1px solid var(--border);color:var(--dim);border-radius:20px;padding:4px 14px;cursor:pointer;font-size:13px}
 .tab.on{color:var(--text);border-color:var(--blue);background:#12233a}
@@ -72,7 +78,7 @@ h2{font-size:14px;color:var(--dim);margin:18px 0 10px;text-transform:uppercase;l
 
 <div class="stats" id="stats"></div>
 
-<h2>Agents 在线</h2>
+<h2>Agents 状态</h2>
 <div class="agents" id="agents"></div>
 
 <h2>任务</h2>
@@ -106,8 +112,9 @@ const STATUS_TXT = {pending:'待领取',in_progress:'进行中',in_review:'待�
 let ov=null, curTab='active', expanded=new Set(), evCache={};
 
 function renderStats(){
-  const s=ov.taskStats, a=ov.agents.length;
-  const cards=[{num:a,lbl:'在线 Agent',hl:true}];
+  const s=ov.taskStats, a=ov.agents;
+  const online=a.filter(x=>x.state!=='offline'), busy=a.filter(x=>x.state==='busy');
+  const cards=[{num:`${online.length}/${a.length}`,lbl:'在线/总Agent',hl:true},{num:busy.length,lbl:'忙碌中',hl:true}];
   for(const k of ['pending','in_progress','in_review','testing','test_failed'])
     if(s[k]) cards.push({num:s[k],lbl:STATUS_TXT[k],hl:true});
   for(const k of ['completed','rejected','cancelled'])
@@ -115,15 +122,22 @@ function renderStats(){
   $('#stats').innerHTML = cards.map(c=>`<div class="stat${c.hl?' hl':''}"><div class="num">${c.num}</div><div class="lbl">${c.lbl}</div></div>`).join('');
 }
 
+const STATE_TXT={busy:'忙碌中',idle:'空闲',offline:'离线'};
+const STATE_CLS={busy:'st-busy',idle:'st-idle',offline:'st-off'};
+
 function renderAgents(){
   const el=$('#agents');
-  if(!ov.agents.length){ el.innerHTML='<div class="empty">无在线 agent</div>'; return; }
-  el.innerHTML = ov.agents.map(a=>`
-    <div class="acard">
-      <div><span class="dot ok" style="margin-right:6px"></span><span class="name">${esc(a.name)}</span> <span class="role">${esc(a.role)}</span></div>
+  if(!ov.agents.length){ el.innerHTML='<div class="empty">暂无注册 agent</div>'; return; }
+  const ord={busy:0,idle:1,offline:2};
+  const list=[...ov.agents].sort((a,b)=>(ord[a.state]??9)-(ord[b.state]??9)||String(a.role).localeCompare(String(b.role)));
+  el.innerHTML = list.map(a=>{
+    const dotCls=a.state==='offline'?'dot bad':'dot ok';
+    return `<div class="acard${a.state==='offline'?' acard-off':''}">
+      <div><span class="${dotCls}" style="margin-right:6px"></span><span class="name">${esc(a.name)}</span> <span class="role">${esc(a.role)}</span> <span class="st ${STATE_CLS[a.state]||''}">${STATE_TXT[a.state]||''}</span></div>
       ${a.capabilities?`<div class="cap">${esc(a.capabilities)}</div>`:''}
-      <div class="seen">seen ${relTime(a.last_seen)}</div>
-    </div>`).join('');
+      ${a.state==='busy'&&a.activeTaskTitles&&a.activeTaskTitles.length?`<div class="busy-tasks">▸ ${a.activeTaskTitles.map(esc).join('<br>▸ ')}</div>`:''}
+      <div class="seen">${a.state==='offline'?(a.offline_at?`离线于 ${relTime(a.offline_at)}`:'已离线'):`心跳 ${relTime(a.last_seen)}`}</div>
+    </div>`;}).join('');
 }
 
 function taskList(){
@@ -139,12 +153,12 @@ function renderTasks(){
   el.innerHTML = list.map(t=>{
     const id8=t.id.slice(0,8);
     const open=expanded.has(t.id);
-    return `<div class="task" id="task-${id8}">
-      <div class="trow" onclick="toggleDetail('${t.id}')">
-        <span class="badge b-${t.status}">${STATUS_TXT[t.status]||t.status}</span>
+    return `<div class="task" id="task-${esc(id8)}">
+      <div class="trow" data-tid="${esc(t.id)}">
+        <span class="badge b-${esc(t.status)}">${esc(STATUS_TXT[t.status]||t.status)}</span>
         ${t.priority==='urgent'?'<span class="pri">urgent</span>':(t.priority==='high'?'<span class="pri" style="color:var(--orange)">high</span>':'')}
         <span class="ttitle">${esc(t.title)}</span>
-        <span class="tmeta"><span class="copy" onclick="event.stopPropagation();copyId('${id8}')" title="点击复制">${id8}</span>
+        <span class="tmeta"><span class="copy" data-copy="${esc(id8)}" title="点击复制">${esc(id8)}</span>
         ${t.assigned_role?`<span>${esc(t.assigned_role)}</span>`:''}
         <span>${relTime(t.updated_at||t.created_at)}</span></span>
       </div>
@@ -168,7 +182,7 @@ function detailHtml(t){
     ${t.result?`<div class="kv result-block">执行输出：</div><pre>${esc(t.result)}</pre>`:''}
     ${review}
     <div class="kv">事件时间线：</div>
-    <div class="timeline" id="ev-${t.id}"><div class="kv">加载中…</div></div>
+    <div class="timeline" id="ev-${esc(t.id)}"><div class="kv">加载中…</div></div>
   </div>`;
 }
 
@@ -197,11 +211,19 @@ function toggleDetail(id){
   if(expanded.has(id)) expanded.delete(id); else expanded.add(id);
   renderTasks();
 }
-function copyId(id8){
-  navigator.clipboard&&navigator.clipboard.writeText(id8);
-  event.target.textContent='已复制';
-  setTimeout(()=>{const e=document.querySelector(`.trow .copy`);},1500);
-}
+// 事件委托：行点击展开/收起，ID 徽标点击复制（替代内联 onclick，消除插值注入面）
+document.addEventListener('click',(ev)=>{
+  const copy=ev.target.closest('.copy');
+  if(copy){
+    const id8=copy.dataset.copy||'';
+    navigator.clipboard&&navigator.clipboard.writeText(id8);
+    copy.textContent='已复制';
+    setTimeout(()=>{copy.textContent=copy.dataset.copy||id8;},1500);
+    return;
+  }
+  const row=ev.target.closest('.trow');
+  if(row&&row.dataset.tid) toggleDetail(row.dataset.tid);
+});
 
 document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
