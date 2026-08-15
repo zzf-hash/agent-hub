@@ -46,7 +46,7 @@ SRV_PID=$!
 sleep 1.2
 
 HEALTH=$(curl -s "$BASE/health" | jq_get data.version)
-if [ "$HEALTH" = "2.1.2" ]; then ok "health version=$HEALTH"; else bad "health version=$HEALTH (期望 2.1.2)"; cat /tmp/hub-test.log; fi
+if [ "$HEALTH" = "2.2.0" ]; then ok "health version=$HEALTH"; else bad "health version=$HEALTH (期望 2.2.0)"; cat /tmp/hub-test.log; fi
 
 # 不带 token 应 401
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/agents")
@@ -56,13 +56,17 @@ H() { curl -s -H "x-auth-token: $TOKEN" "$@"; }   # 带鉴权的 curl
 reg() { H -X POST $BASE/api/register -H 'Content-Type: application/json' -d "{\"name\":\"$1\",\"role\":\"$2\",\"project\":\"yiyuan\"}" | jq_get data.agent_id; }
 
 # ---------- T1 替换不可复活 ----------
-section "T1 被替换agent不可复活（同角色双在线根因）"
+section "T1 被替换agent不可复活（v2.2：手动替换）"
 X=$(reg agentX backend)
 Y=$(reg agentY backend)
 [ -n "$X" ] && [ "$X" != "undefined" ] && ok "register X=$X" || { bad "register X 失败"; }
-[ -n "$Y" ] && [ "$Y" != "undefined" ] && ok "register Y=$Y（X 被替换）" || { bad "register Y 失败"; }
+[ -n "$Y" ] && [ "$Y" != "undefined" ] && ok "register Y=$Y（X 不受影响——v2.2 幂等注册不自动替换）" || { bad "register Y 失败"; }
 ST=$(sq "SELECT status FROM agents WHERE id='$X'")
-[ "$ST" = "replaced" ] && ok "X 状态=replaced（墓碑已写入）" || bad "X 状态=$ST（期望 replaced）"
+[ "$ST" = "online" ] && ok "T1-0 X 仍 online（register 不再自动墓碑）" || bad "T1-0 X 状态=$ST（期望 online）"
+# v2.2：替换改为手动 API（面板操作）
+H -X POST $BASE/api/agents/$X/replace -H 'Content-Type: application/json' -d '{"reason":"T1测试替换"}' > /dev/null
+ST=$(sq "SELECT status FROM agents WHERE id='$X'")
+[ "$ST" = "replaced" ] && ok "手动替换后 X=replaced（墓碑已写入）" || bad "X 状态=$ST（期望 replaced）"
 # X 拉消息（旧轮询进程行为）→ 不得复活
 H "$BASE/api/messages/$X" > /dev/null
 ST=$(sq "SELECT status FROM agents WHERE id='$X'")
@@ -105,8 +109,8 @@ EV=$(sq "SELECT COUNT(*) FROM task_events WHERE task_id='$TASK' AND event='claim
 
 # ---------- T4 认领互斥 ----------
 section "T4 认领互斥 + manager强制流转"
-# 注意：同项目同角色注册会顶掉旧身份（F→replaced），此时 F2 操作走“接管”而非互斥。
-# 互斥拒绝的正确场景：异角色（QA）操作仍在线认领人（agentF）的任务。
+# v2.2：同项目同角色不再自动顶替（各自独立身份）。互斥拒绝场景：
+# 1) 异角色（QA）操作认领人任务；2) 同角色但非认领人的在途任务操作。
 QA=$(reg agentQA qa)
 RESP=$(H -X PUT $BASE/api/tasks/$TASK -H 'Content-Type: application/json' -d "{\"from_id\":\"$QA\",\"status\":\"in_review\"}")
 echo "$RESP" | grep -q "已由 agentF 认领" && ok "T4a QA被拒（错误信息含认领人名字）" || bad "T4a QA未被正确拒绝: $RESP"
@@ -117,12 +121,13 @@ echo "$RESP" | grep -q '"code":0' && ok "T4c manager 强制流转成功" || bad 
 
 # ---------- T4d/e/f 死亡身份接管 + 僵尸守卫（v2.1.1）----------
 section "T4d/e/f 死亡身份接管 + 僵尸守卫"
-# 用独立项目 yiyuan2 隔离，避免与前面的 agentF/frontend 身份链互相顶替
+# 用独立项目 yiyuan2 隔离；v2.2 下旧身份用「手动替换（无后继）」构造
 RTK=$(H -X POST $BASE/api/tasks -H 'Content-Type: application/json' -d "{\"created_by\":\"$M\",\"project\":\"yiyuan2\",\"title\":\"T4d接管测试\",\"to_role\":\"frontend\"}" | jq_get data.task_id)
 FO=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"frontOld","role":"frontend","project":"yiyuan2"}' | jq_get data.agent_id)
 FN=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"frontNew","role":"frontend","project":"yiyuan2"}' | jq_get data.agent_id)
+H -X POST $BASE/api/agents/$FO/replace -H 'Content-Type: application/json' -d '{"reason":"T4d构造死亡assignee"}' > /dev/null
 ST=$(sq "SELECT status FROM agents WHERE id='$FO'")
-[ "$ST" = "replaced" ] && ok "T4d-0 frontOld 被 frontNew 替换为 replaced" || bad "T4d-0 frontOld状态=$ST"
+[ "$ST" = "replaced" ] && ok "T4d-0 frontOld 被手动替换为 replaced" || bad "T4d-0 frontOld状态=$ST"
 # frontOld（僵尸身份）直接操作 → 应被僵尸守卫拒绝
 RESP=$(H -X PUT $BASE/api/tasks/$RTK -H 'Content-Type: application/json' -d "{\"from_id\":\"$FO\",\"status\":\"in_progress\"}")
 echo "$RESP" | grep -q '"code":1' && ok "T4f 僵尸身份操作任务被拒" || bad "T4f 僵尸身份未被拒: $RESP"
@@ -154,7 +159,7 @@ echo "$RESP" | grep -q '"code":0' && ok "T5c tasks过滤 OK" || bad "T5c tasks�
 RESP=$(H -X POST $BASE/api/send_message -H 'Content-Type: application/json' -d "{\"from_id\":\"$M\",\"from_role\":\"manager\",\"to_role\":\"backend\",\"project\":\"yiyuan\",\"content\":\"T5消息\"}")
 echo "$RESP" | grep -q '"code":0' && ok "T5d send_message(to_role) OK" || bad "T5d send_message失败: $RESP"
 # review approve（PM 实际用 approve:true 形式）
-# 注：前面 T4 里 F2 注册把 F 顶成 replaced（F 的流转会静默失败），这里任务由 M 直接建并流转
+# 注：v2.2 下 F 不再被自动顶替；但 T4 已把任务流转到 in_review，此处用 M 建新任务验证 review 流
 RT=$(H -X POST $BASE/api/tasks -H 'Content-Type: application/json' -d "{\"created_by\":\"$M\",\"project\":\"yiyuan\",\"title\":\"T5审核测试\",\"to_role\":\"frontend\"}" | jq_get data.task_id)
 H -X PUT $BASE/api/tasks/$RT -H 'Content-Type: application/json' -d "{\"from_id\":\"$M\",\"status\":\"in_progress\"}" > /dev/null
 H -X PUT $BASE/api/tasks/$RT -H 'Content-Type: application/json' -d "{\"from_id\":\"$M\",\"status\":\"in_review\"}" > /dev/null
@@ -175,36 +180,39 @@ RESP=$(H -X POST $BASE/api/offline/$X)
 ST=$(sq "SELECT status FROM agents WHERE id='$X'")
 if [ "$ST" = "replaced" ]; then ok "T6a X被替换后调offline仍 replaced"; else bad "T6a offline把墓碑降级成 $ST（旁路复活漏洞！）"; fi
 echo "$RESP" | grep -q '不可置 offline\|replaced' && ok "T6b offline返回拒绝提示" || bad "T6b offline响应无拒绝语义: $RESP"
-# 对照：online 身份 offline 仍正常（注：T2 里 Z 注册时顶掉了 Y，用新鲜注册的 online 身份验证）
+# 对照：online 身份 offline 仍正常（v2.2 下各身份独立，用新鲜注册的 online 身份验证）
 Z2=$(reg agentZ2 backend)
 RESP=$(H -X POST $BASE/api/offline/$Z2)
 ST=$(sq "SELECT status FROM agents WHERE id='$Z2'")
 [ "$ST" = "offline" ] && ok "T6c 正常online身份offline成功" || bad "T6c online身份offline失败: $ST resp=$RESP"
 
-# ---------- T7 替换移交（v2.1.2 A3）----------
-section "T7 同名重注册移交未终态任务"
-# F2 持任务 in_progress → 同名同角色重注册 F2' → 任务应移交 F2' 且 F2' 可直接流转
+# ---------- T7 手动替换移交（v2.2：replace+successor_id）----------
+section "T7 手动替换移交在途任务"
+# F2 持任务 in_progress → 手动替换（后继=F3）→ 任务应移交 F3 且 F3 可直接流转
 T7TASK=$(H -X POST $BASE/api/tasks -H 'Content-Type: application/json' -d "{\"created_by\":\"$M\",\"project\":\"yiyuan3\",\"title\":\"T7移交测试\",\"to_role\":\"frontend\"}" | jq_get data.task_id)
 FH=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"frontHand","role":"frontend","project":"yiyuan3"}' | jq_get data.agent_id)
 H -X PUT $BASE/api/tasks/$T7TASK -H 'Content-Type: application/json' -d "{\"from_id\":\"$FH\",\"status\":\"in_progress\"}" > /dev/null
 AID=$(sq "SELECT assigned_id FROM tasks WHERE id='$T7TASK'")
 [ "$AID" = "$FH" ] && ok "T7a frontHand 持任务 in_progress" || bad "T7a 认领失败 assigned_id=$AID"
-# 同名重注册（模拟换会话）
-FH2=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"frontHand","role":"frontend","project":"yiyuan3"}' | jq_get data.agent_id)
-[ "$FH2" != "$FH" ] && [ -n "$FH2" ] && [ "$FH2" != "undefined" ] && ok "T7b 同名重注册得新身份" || bad "T7b 重注册失败: $FH2"
+# 后继 F3（同角色同项目）
+FH3=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"frontHand3","role":"frontend","project":"yiyuan3"}' | jq_get data.agent_id)
+[ -n "$FH3" ] && [ "$FH3" != "undefined" ] && ok "T7b 后继 F3 注册" || bad "T7b F3 注册失败: $FH3"
+# 手动替换 F → 后继 F3
+RESP=$(H -X POST $BASE/api/agents/$FH/replace -H 'Content-Type: application/json' -d "{\"successor_id\":\"$FH3\",\"reason\":\"T7移交\"}")
 AID=$(sq "SELECT assigned_id FROM tasks WHERE id='$T7TASK'")
-[ "$AID" = "$FH2" ] && ok "T7c 任务 assigned_id 已移交新身份" || bad "T7c 未移交 assigned_id=$AID（期望 $FH2）"
-# F2'（新身份）直接流转——不得因绑定旧身份被拒
-RESP=$(H -X PUT $BASE/api/tasks/$T7TASK -H 'Content-Type: application/json' -d "{\"from_id\":\"$FH2\",\"status\":\"in_review\"}")
+[ "$AID" = "$FH3" ] && ok "T7c 任务 assigned_id 已移交后继 F3" || bad "T7c 未移交 assigned_id=$AID（期望 $FH3）resp=$RESP"
+# F3（后继）直接流转——不得因绑定旧身份被拒
+RESP=$(H -X PUT $BASE/api/tasks/$T7TASK -H 'Content-Type: application/json' -d "{\"from_id\":\"$FH3\",\"status\":\"in_review\"}")
 ST=$(sq "SELECT status FROM tasks WHERE id='$T7TASK'")
-if [ "$ST" = "in_review" ]; then ok "T7d 新身份可直接流转（无死锁）"; else bad "T7d 流转失败: $ST resp=$RESP"; fi
-# 终态任务不移交（回归保护）
+if [ "$ST" = "in_review" ]; then ok "T7d 后继可直接流转（无死锁）"; else bad "T7d 流转失败: $ST resp=$RESP"; fi
+# 终态任务不被移交（回归保护）
 H -X PUT $BASE/api/tasks/$T7TASK -H 'Content-Type: application/json' -d "{\"from_id\":\"$M\",\"status\":\"testing\"}" > /dev/null
 H -X PUT $BASE/api/tasks/$T7TASK -H 'Content-Type: application/json' -d "{\"from_id\":\"$M\",\"status\":\"test_passed\"}" > /dev/null
 H -X PUT $BASE/api/tasks/$T7TASK -H 'Content-Type: application/json' -d "{\"from_id\":\"$M\",\"status\":\"completed\"}" > /dev/null
-FH3=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"frontHand","role":"frontend","project":"yiyuan3"}' | jq_get data.agent_id)
+FH4=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"frontHand4","role":"frontend","project":"yiyuan3"}' | jq_get data.agent_id)
+H -X POST $BASE/api/agents/$FH4/replace -H 'Content-Type: application/json' -d "{\"successor_id\":\"$FH3\"}" > /dev/null
 AID=$(sq "SELECT assigned_id FROM tasks WHERE id='$T7TASK'")
-[ "$AID" = "$FH2" ] && ok "T7e 终态任务不被移交（completed保持原assignee）" || bad "T7e 终态任务被误移交: $AID"
+[ "$AID" = "$FH3" ] && ok "T7e 终态任务不被移交（completed保持原assignee）" || bad "T7e 终态任务被误移交: $AID"
 
 # ---------- T8 冷启动（v2.1.2 A2）----------
 section "T8 冷启动：无 config.yaml 可启动"
@@ -218,12 +226,75 @@ sleep 1.5
 CH=$(curl -s http://localhost:8298/health | jq_get data.status)
 CV=$(curl -s http://localhost:8298/health | jq_get data.version)
 if [ "$CH" = "running" ]; then ok "T8a 无config.yaml启动成功 status=running"; else bad "T8a 冷启动失败: $CH"; cat /tmp/hub-coldstart.log; fi
-[ "$CV" = "2.1.2" ] && ok "T8b 版本=$CV" || bad "T8b 版本=$CV（期望 2.1.2）"
+[ "$CV" = "2.2.0" ] && ok "T8b 版本=$CV" || bad "T8b 版本=$CV（期望 2.2.0）"
 # 子 shell 里的 $! 拿不到外层，兜底 pkill 本脚本启动的 8298 node（端口唯一，误杀面为零）
 pkill -f "PORT=8298" 2>/dev/null; sleep 0.3
 COLD_NODE=$(ss -tlnp 2>/dev/null | grep ':8298' | grep -oP 'pid=\K[0-9]+' | head -1)
 [ -z "$COLD_NODE" ] || kill "$COLD_NODE" 2>/dev/null
 rm -rf "$COLD" /tmp/hub-coldstart.pid
+
+# ---------- T9 v2.2 幂等注册 + 手动替换/移交 ----------
+section "T9 v2.2 幂等注册与手动替换/移交"
+# T9a 同名重注册幂等：返回同一 agent_id，不顶替
+IA=$(reg idemA backend)
+IA2=$(reg idemA backend)
+[ "$IA" = "$IA2" ] && [ -n "$IA" ] && [ "$IA" != "undefined" ] && ok "T9a 同名重注册幂等（同一ID）" || bad "T9a 重注册不幂等: $IA vs $IA2"
+# T9b offline 身份重注册 → 复用同一ID并复活 online（agent_id 类比 openid 的定案语义）
+H -X POST $BASE/api/offline/$IA > /dev/null
+IA3=$(reg idemA backend)
+ST=$(sq "SELECT status FROM agents WHERE id='$IA'")
+[ "$IA3" = "$IA" ] && [ "$ST" = "online" ] && ok "T9b offline身份重注册复活online（同ID）" || bad "T9b 重注册: id=$IA3/$IA status=$ST"
+# T9c replaced 身份重注册 → 新 agent_id，旧墓碑不受影响（幂等边界）
+TB=$(reg lifeB backend)
+H -X POST $BASE/api/agents/$TB/replace -H 'Content-Type: application/json' -d '{"reason":"T9c边界"}' > /dev/null
+TB2=$(reg lifeB backend)
+STOLD=$(sq "SELECT status FROM agents WHERE id='$TB'")
+[ "$TB2" != "$TB" ] && [ -n "$TB2" ] && [ "$TB2" != "undefined" ] && [ "$STOLD" = "replaced" ] \
+  && ok "T9c replaced后同名重注册得新ID（旧墓碑不动）" || bad "T9c: new=$TB2 old=$TB oldStatus=$STOLD"
+# replaced 身份心跳/拉消息均不复活（快速回归，详见T1）
+H -X POST $BASE/mcp/tools/heartbeat -H 'Content-Type: application/json' -d "{\"from_id\":\"$TB\"}" > /dev/null
+H "$BASE/api/messages/$TB" > /dev/null
+ST=$(sq "SELECT status FROM agents WHERE id='$TB'")
+[ "$ST" = "replaced" ] && ok "T9c-2 replaced 心跳+拉消息不复活" || bad "T9c-2 replaced被复活: $ST"
+
+# T9d replace 后继校验：跨角色后继被拒
+RC=$(reg roleCk frontend)
+RB=$(reg roleBk backend)
+RESP=$(H -X POST $BASE/api/agents/$RB/replace -H 'Content-Type: application/json' -d "{\"successor_id\":\"$RC\",\"reason\":\"跨角色\"}")
+ST=$(sq "SELECT status FROM agents WHERE id='$RB'")
+echo "$RESP" | grep -q '"code":1' && [ "$ST" != "replaced" ] && ok "T9d replace 跨角色后继被拒（源未动）" || bad "T9d 跨角色未被拒或源被动: resp=$RESP st=$ST"
+# 重复替换已 replaced 身份被拒
+RESP=$(H -X POST $BASE/api/agents/$TB/replace -H 'Content-Type: application/json' -d '{"reason":"二次替换"}')
+echo "$RESP" | grep -q '"code":1' && ok "T9d-2 二次replace被拒" || bad "T9d-2 二次replace未被拒: $RESP"
+
+# T9e 任务级手动移交 POST /api/tasks/:id/transfer
+T9T=$(H -X POST $BASE/api/tasks -H 'Content-Type: application/json' -d "{\"created_by\":\"$M\",\"project\":\"yiyuan4\",\"title\":\"T9移交测试\",\"to_role\":\"backend\"}" | jq_get data.task_id)
+TF=$(reg transferFrom backend)
+TT=$(reg transferTo backend)
+H -X PUT $BASE/api/tasks/$T9T -H 'Content-Type: application/json' -d "{\"from_id\":\"$TF\",\"status\":\"in_progress\"}" > /dev/null
+RESP=$(H -X POST $BASE/api/tasks/$T9T/transfer -H 'Content-Type: application/json' -d "{\"to_id\":\"$TT\"}")
+AID=$(sq "SELECT assigned_id FROM tasks WHERE id='$T9T'")
+[ "$AID" = "$TT" ] && ok "T9e-1 transfer 后 assigned_id 移交" || bad "T9e-1 未移交: $AID（期望 $TT）resp=$RESP"
+# 源身份不被墓碑（任务移交≠身份替换）
+ST=$(sq "SELECT status FROM agents WHERE id='$TF'")
+[ "$ST" = "online" ] && ok "T9e-2 源身份仍 online（不墓碑）" || bad "T9e-2 源身份被误动: $ST"
+# 后继可直接流转（无死锁）
+H -X PUT $BASE/api/tasks/$T9T -H 'Content-Type: application/json' -d "{\"from_id\":\"$TT\",\"status\":\"in_review\"}" > /dev/null
+ST=$(sq "SELECT status FROM tasks WHERE id='$T9T'")
+[ "$ST" = "in_review" ] && ok "T9e-3 新持有人可直接流转" || bad "T9e-3 流转失败: $ST"
+# 已由目标持有时再移交被拒
+RESP=$(H -X POST $BASE/api/tasks/$T9T/transfer -H 'Content-Type: application/json' -d "{\"to_id\":\"$TT\"}")
+echo "$RESP" | grep -q '"code":1' && ok "T9e-4 重复移交目标本人被拒" || bad "T9e-4 未被拒: $RESP"
+# 跨角色目标被拒
+TQ=$(reg transferQa qa)
+RESP=$(H -X POST $BASE/api/tasks/$T9T/transfer -H 'Content-Type: application/json' -d "{\"to_id\":\"$TQ\"}")
+echo "$RESP" | grep -q '"code":1' && ok "T9e-5 跨角色移交被拒" || bad "T9e-5 未被拒: $RESP"
+# 终态任务不可移交（回归保护）
+H -X PUT $BASE/api/tasks/$T9T -H 'Content-Type: application/json' -d "{\"from_id\":\"$M\",\"status\":\"testing\"}" > /dev/null
+H -X PUT $BASE/api/tasks/$T9T -H 'Content-Type: application/json' -d "{\"from_id\":\"$M\",\"status\":\"test_passed\"}" > /dev/null
+H -X PUT $BASE/api/tasks/$T9T -H 'Content-Type: application/json' -d "{\"from_id\":\"$M\",\"status\":\"completed\"}" > /dev/null
+RESP=$(H -X POST $BASE/api/tasks/$T9T/transfer -H 'Content-Type: application/json' -d "{\"to_id\":\"$TF\"}")
+echo "$RESP" | grep -q '"code":1' && ok "T9e-6 终态任务不可移交" || bad "T9e-6 终态未被拒: $RESP"
 
 # ---------- 收尾 ----------
 echo

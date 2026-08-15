@@ -679,45 +679,30 @@ const MCP_TOOLS = [
 
 // ---------- 工具实现 ----------
 const tools = {
+  // v2.2 幂等注册（老板定案：agent_id 类比 openid，一次注册永久身份）：
+  // - 同 name+role+project 且 status IN ('online','offline') 已存在 → 复用该 agent_id（revived:true），
+  //   置 online 刷新 last_seen；不迁移消息、不关 SSE（身份没变，无需迁移）。
+  // - 不存在或旧身份已是 replaced（手动替换产物）→ 插入新行（revived:false）。
+  // - 废除 v2.1 的"register 自动墓碑同 project+role 旧 agent"——替换改为面板手动操作（POST /api/agents/:id/replace）。
   register({ name, role, project, capabilities = '' }) {
-    const id = uuidv4();
-    
-    const oldAgents = db.prepare(
-      `SELECT id FROM agents WHERE project = ? AND role = ? AND status IN ('online','offline')`
-    ).all(project, role);
+    const existing = db.prepare(
+      `SELECT id FROM agents WHERE name = ? AND role = ? AND project = ? AND status IN ('online','offline') ORDER BY online_at DESC LIMIT 1`
+    ).get(name, role, project);
 
-    // v2.1 身份机制：被替换的旧 agent 置 'replaced' 终态墓碑（防残留轮询进程自我复活）。
-    // 只对 online/offline 置换；已是 replaced 的不重复处理（保持原 replaced_at 不变）。
-    for (const old of oldAgents) {
-      db.prepare(`UPDATE agents SET status = 'replaced', replaced_at = ?, offline_at = ? WHERE id = ?`)
-        .run(now(), now(), old.id);
+    if (existing) {
+      db.prepare(`UPDATE agents SET status = 'online', last_seen = ?, capabilities = ? WHERE id = ?`)
+        .run(now(), capabilities, existing.id);
+      log('info', `Agent revived (idempotent register)`, { id: existing.id, name, role, project });
+      return { agent_id: existing.id, revived: true };
     }
 
+    const id = uuidv4();
     db.prepare(
       `INSERT INTO agents (id, name, role, project, capabilities, status, online_at, last_seen)
        VALUES (?, ?, ?, ?, ?, 'online', ?, ?)`
     ).run(id, name, role, project, capabilities, now(), now());
-
-    for (const old of oldAgents) {
-      db.prepare(
-        `UPDATE messages SET to_id = ? WHERE to_id = ? AND is_read = 0`
-      ).run(id, old.id);
-      // v2.1.2 A3 替换移交：旧身份持有的未终态任务（pending/in_progress/in_review/testing/rejected）
-      // 移交新 agent_id，避免换人后任务死锁（此前只有 manager 能解锁）。
-      // 只移交给同 project+role 的新身份（oldAgents 本身就是按 project+role 筛的，天然同构）。
-      const HANDOVER_STATES = "('pending','in_progress','in_review','testing','rejected')";
-      const moved = db.prepare(
-        `UPDATE tasks SET assigned_id = ? WHERE assigned_id = ? AND status IN ${HANDOVER_STATES}`
-      ).run(id, old.id);
-      if (moved.changes > 0) {
-        log('info', `Task handover on replace`, { from: old.id, to: id, count: moved.changes });
-      }
-      // [Phase1] 旧agent实例被替换，关闭其全部SSE连接（连接方需用新agent_id重连）
-      closeSseForAgent(old.id);
-    }
-
     log('info', `Agent registered`, { id, name, role, project });
-    return { agent_id: id, replaced: oldAgents.length };
+    return { agent_id: id, revived: false };
   },
 
   send_message({ from_id, to_id, to_role, content }) {
@@ -1088,6 +1073,40 @@ const tools = {
     sql += ` ORDER BY online_at DESC`;
 
     const rows = db.prepare(sql).all(...params);
+
+    // v2.2 四态派生字段（仅 online_only=false 全量查询时附加，兼容现有调用方）：
+    // active_task_count: 该 agent 认领的 in_progress 任务数
+    // pending_task_count: 直接指派待接取(pending+assigned_id) + 角色队列(assigned_id IS NULL 且 assigned_role 匹配)
+    // display_state: offline | online_idle | online_busy（replaced 行照常返回，display_state 置 'replaced'）
+    if (!online_only) {
+      const activeMap = new Map();
+      db.prepare(
+        `SELECT assigned_id, COUNT(*) as c FROM tasks WHERE status = 'in_progress' AND assigned_id IS NOT NULL GROUP BY assigned_id`
+      ).all().forEach((r) => activeMap.set(r.assigned_id, r.c));
+      const assignedPendingMap = new Map();
+      db.prepare(
+        `SELECT assigned_id, COUNT(*) as c FROM tasks WHERE status = 'pending' AND assigned_id IS NOT NULL GROUP BY assigned_id`
+      ).all().forEach((r) => assignedPendingMap.set(r.assigned_id, r.c));
+      // 角色队列：任务未指定人且角色匹配（dashboard 需按 project 过滤后自行匹配角色）
+      const rolePendingRows = db.prepare(
+        `SELECT assigned_role, project, COUNT(*) as c FROM tasks WHERE status = 'pending' AND assigned_id IS NULL AND assigned_role IS NOT NULL GROUP BY assigned_role, project`
+      ).all();
+
+      for (const row of rows) {
+        const active = activeMap.get(row.id) || 0;
+        const pendingAssigned = assignedPendingMap.get(row.id) || 0;
+        const pendingQueue = rolePendingRows
+          .filter((r) => r.project === row.project && r.assigned_role === row.role)
+          .reduce((s, r) => s + r.c, 0);
+        row.active_task_count = active;
+        row.pending_task_count = pendingAssigned + pendingQueue;
+        row.display_state = row.status === 'replaced'
+          ? 'replaced'
+          : row.status === 'online'
+            ? (active > 0 ? 'online_busy' : 'online_idle')
+            : 'offline';
+      }
+    }
     return { agents: rows };
   },
 
@@ -1139,7 +1158,7 @@ app.get('/health', (req, res) => {
     epics: db.prepare(`SELECT COUNT(*) as c FROM epics`).get().c,
     projects: db.prepare(`SELECT COUNT(DISTINCT project) as c FROM agents WHERE status = 'online'`).get().c
   };
-  res.json(ok({ status: 'running', version: '2.1.2', uptime: process.uptime(), ...counts }));
+  res.json(ok({ status: 'running', version: '2.2.0', uptime: process.uptime(), ...counts }));
 });
 
 // MCP 协议: 列出工具
@@ -1401,6 +1420,122 @@ app.get('/api/agents', authMiddleware, (req, res) => {
   catch (err) { res.status(500).json(fail(err.message)); }
 });
 
+// v2.2 手动替换（老板面板操作）：POST /api/agents/:id/replace {reason?, successor_id?}
+//   - 置 status='replaced' + replaced_at，关 SSE
+//   - successor_id 存在 → 在途任务(pending/in_progress/in_review) assigned_id 改指 successor、未读消息迁移、双方通知
+//   - 无 successor → 在途任务 assigned_id 置 NULL 回 pending 待重认领，按 to_role 通知
+//   - 鉴权走全局 authMiddleware token（调用方是 dashboard 服务端，无 agent 身份）
+app.post('/api/agents/:id/replace', authMiddleware, (req, res) => {
+  try {
+    const id = req.params.id;
+    const { reason, successor_id } = req.body || {};
+    const agent = db.prepare(`SELECT * FROM agents WHERE id = ?`).get(id);
+    if (!agent) return res.status(404).json(fail('agent 不存在'));
+    if (agent.status === 'replaced') return res.status(400).json(fail('该身份已是 replaced 终态'));
+
+    let successor = null;
+    if (successor_id) {
+      successor = db.prepare(`SELECT * FROM agents WHERE id = ?`).get(successor_id);
+      if (!successor) return res.status(400).json(fail('后继 agent 不存在'));
+      if (successor.id === agent.id) return res.status(400).json(fail('后继不能是被替换者本人'));
+      if (successor.role !== agent.role || successor.project !== agent.project) {
+        return res.status(400).json(fail(`后继须同角色同项目（期望 ${agent.role}/${agent.project}，实际 ${successor.role}/${successor.project}）`));
+      }
+      if (successor.status === 'replaced') return res.status(400).json(fail('后继身份已是 replaced 终态'));
+    }
+
+    const IN_FLIGHT = "('pending','in_progress','in_review')";
+    const tasksToMove = db.prepare(
+      `SELECT id, title FROM tasks WHERE assigned_id = ? AND status IN ${IN_FLIGHT}`
+    ).all(id);
+
+    db.prepare(`UPDATE agents SET status = 'replaced', replaced_at = ?, offline_at = ? WHERE id = ?`)
+      .run(now(), now(), id);
+    closeSseForAgent(id);
+
+    let movedTasks = 0;
+    if (successor) {
+      const moved = db.prepare(
+        `UPDATE tasks SET assigned_id = ? WHERE assigned_id = ? AND status IN ${IN_FLIGHT}`
+      ).run(successor.id, id);
+      movedTasks = moved.changes;
+      db.prepare(`UPDATE messages SET to_id = ? WHERE to_id = ? AND is_read = 0`).run(successor.id, id);
+      for (const t of tasksToMove) {
+        logEvent(t.id, 'transfer', 'in_flight', 'in_flight', successor.id, successor.name,
+          `替换移交：${agent.name} → ${successor.name}${reason ? '（' + reason + '）' : ''}`);
+      }
+      notifyAgent(successor.id, agent.project,
+        `🔄 替换移交：${agent.name} 的 ${moved.changes} 个在途任务已移交给你${reason ? '（原因：' + reason + '）' : ''}`);
+      notifyAgent(id, agent.project,
+        `⛔ 你的身份已被手动替换（后继 ${successor.name}）${reason ? '，原因：' + reason : ''}`);
+    } else {
+      const cleared = db.prepare(
+        `UPDATE tasks SET assigned_id = NULL WHERE assigned_id = ? AND status IN ${IN_FLIGHT}`
+      ).run(id);
+      movedTasks = -cleared.changes; // 负数表示"回池待认领"而非移交
+      for (const t of tasksToMove) {
+        // assigned_id 置 NULL 的任务若在 in_progress 需回 pending 待重认领
+        const cur = db.prepare(`SELECT status FROM tasks WHERE id = ?`).get(t.id);
+        if (cur && cur.status !== 'pending') {
+          db.prepare(`UPDATE tasks SET status = 'pending', updated_at = ? WHERE id = ?`).run(now(), t.id);
+          logEvent(t.id, 'status_change', cur.status, 'pending', null, null,
+            `认领人 ${agent.name} 被替换（无后继），任务回池待认领${reason ? '（' + reason + '）' : ''}`);
+        }
+      }
+      notifyRole(agent.role, agent.project,
+        `♻️ ${agent.name} 已被手动替换（无后继），其 ${cleared.changes} 个在途任务已回池待认领`);
+      notifyAgent(id, agent.project, `⛔ 你的身份已被手动替换${reason ? '（原因：' + reason + '）' : ''}`);
+    }
+
+    log('info', `Agent replaced (manual)`, { id, name: agent.name, successor: successor ? successor.name : null, reason });
+    res.json(ok({
+      replaced: agent.name,
+      successor: successor ? successor.name : null,
+      tasks_affected: Math.abs(movedTasks),
+      disposition: successor ? 'transferred' : 'returned_to_pool'
+    }));
+  }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// v2.2 手动移交（老板面板操作）：POST /api/tasks/:id/transfer {to_id}
+//   目标须存在且 assigned_role 与其角色一致（manager 例外）；仅 pending/in_progress/in_review 可移交
+app.post('/api/tasks/:id/transfer', authMiddleware, (req, res) => {
+  try {
+    const taskId = req.params.id;
+    const toId = (req.body || {}).to_id;
+    if (!toId) return res.status(400).json(fail('需要 to_id'));
+    const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId);
+    if (!task) return res.status(404).json(fail('任务不存在'));
+    const TRANSFERABLE = ['pending', 'in_progress', 'in_review'];
+    if (!TRANSFERABLE.includes(task.status)) {
+      return res.status(400).json(fail(`状态 ${task.status} 不可移交（仅 ${TRANSFERABLE.join('/')}）`));
+    }
+    const target = db.prepare(`SELECT * FROM agents WHERE id = ?`).get(toId);
+    if (!target) return res.status(400).json(fail('目标 agent 不存在'));
+    if (target.status === 'replaced') return res.status(400).json(fail('目标身份已是 replaced 终态'));
+    if (target.role !== task.assigned_role && target.role !== 'manager') {
+      return res.status(400).json(fail(`目标角色 ${target.role} 与任务角色 ${task.assigned_role} 不匹配`));
+    }
+    if (task.assigned_id === toId) return res.status(400).json(fail('任务已由目标 agent 持有'));
+
+    const prevId = task.assigned_id;
+    const prev = prevId ? db.prepare(`SELECT name FROM agents WHERE id = ?`).get(prevId) : null;
+
+    db.prepare(`UPDATE tasks SET assigned_id = ?, updated_at = ? WHERE id = ?`).run(toId, now(), taskId);
+    logEvent(taskId, 'transferred', task.status, task.status, toId, target.name,
+      `手动移交${prev ? `：${prev.name} → ${target.name}` : `（此前无人认领）→ ${target.name}`}`);
+    notifyAgent(toId, task.project, `📥 任务移交给你：${task.title}（来自 ${prev ? prev.name : '任务池'}）`);
+    if (prevId && prevId !== toId) {
+      notifyAgent(prevId, task.project, `📤 你的任务已被移交：${task.title} → ${target.name}`);
+    }
+
+    log('info', `Task transferred (manual)`, { task_id: taskId, from: prevId, to: toId });
+    res.json(ok({ task_id: taskId, from: prevId, to: toId, to_name: target.name }));
+  }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
 app.post('/api/offline/:agent_id', authMiddleware, (req, res) => {
   try { res.json(ok(tools.offline({ from_id: req.params.agent_id }))); }
   catch (err) { res.status(500).json(fail(err.message)); }
@@ -1434,7 +1569,7 @@ setInterval(() => {
 
 // ---------- 启动 ----------
 app.listen(PORT, '0.0.0.0', () => {
-  log('info', `Agent Hub v2.1.1 running on port ${PORT}`);
+  log('info', `Agent Hub v2.2.0 running on port ${PORT}`);
   log('info', `Health: http://localhost:${PORT}/health`);
   log('info', `MCP Tools: http://localhost:${PORT}/mcp/tools`);
   log('info', `State Machine: http://localhost:${PORT}/api/state-machine`);
