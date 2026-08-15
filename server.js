@@ -24,12 +24,14 @@ rawConfig.split('\n').forEach(line => {
   if (m && m[2].trim()) config[m[1]] = m[2].trim().replace(/^["']|["']$/g, '');
 });
 
-const PORT = parseInt(config.port) || 8100;
-const AUTH_TOKEN = config.auth_token || '';
-const DB_PATH = config.db_path || './db.sqlite';
-const LOG_LEVEL = config.log_level || 'info';
-const HERMES_WEBHOOK_URL = config.hermes_webhook_url || '';
-const HERMES_WEBHOOK_SECRET = config.hermes_webhook_secret || '';
+// v2.1: 支持环境变量覆盖（隔离测试实例用：PORT=8199 HUB_DB=/tmp/x.sqlite node server.js）
+// v2.2: 支持 env 覆盖（测试隔离实例用 PORT/HUB_DB/HUB_WEBHOOK_URL，不设则与原行为完全一致）
+const PORT = parseInt(process.env.PORT || config.port) || 8100;
+const AUTH_TOKEN = process.env.HUB_AUTH_TOKEN || config.auth_token || '';
+const DB_PATH = process.env.HUB_DB || config.db_path || './db.sqlite';
+const LOG_LEVEL = process.env.HUB_LOG_LEVEL || config.log_level || 'info';
+const HERMES_WEBHOOK_URL = process.env.HUB_WEBHOOK_URL !== undefined ? process.env.HUB_WEBHOOK_URL : (config.hermes_webhook_url || '');
+const HERMES_WEBHOOK_SECRET = process.env.HUB_WEBHOOK_SECRET !== undefined ? process.env.HUB_WEBHOOK_SECRET : (config.hermes_webhook_secret || '');
 
 // ---------- 日志 ----------
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
@@ -43,6 +45,7 @@ function log(level, msg, data) {
 // ---------- 数据库初始化 ----------
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
+
 
 // v1 表（兼容已有数据）
 db.exec(`
@@ -153,6 +156,13 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status);
   CREATE INDEX IF NOT EXISTS idx_agents_project ON agents(project);
 `);
+
+// v2.1 身份机制：agents 表加 replaced_at 列（replaced 墓碑时间戳，幂等迁移）
+// 注意：必须在上面 CREATE TABLE agents 之后执行（全新库首启时表刚建好）
+try {
+  db.exec(`ALTER TABLE agents ADD COLUMN replaced_at TEXT`);
+  log('info', `Migration: added column replaced_at to agents`);
+} catch (e) { /* 列已存在，跳过 */ }
 
 // ---------- 工具函数 ----------
 function now() { return new Date().toISOString(); }
@@ -663,12 +673,14 @@ const tools = {
     const id = uuidv4();
     
     const oldAgents = db.prepare(
-      `SELECT id FROM agents WHERE project = ? AND role = ? AND status = 'online'`
+      `SELECT id FROM agents WHERE project = ? AND role = ? AND status IN ('online','offline')`
     ).all(project, role);
-    
+
+    // v2.1 身份机制：被替换的旧 agent 置 'replaced' 终态墓碑（防残留轮询进程自我复活）。
+    // 只对 online/offline 置换；已是 replaced 的不重复处理（保持原 replaced_at 不变）。
     for (const old of oldAgents) {
-      db.prepare(`UPDATE agents SET status = 'offline', offline_at = ? WHERE id = ?`)
-        .run(now(), old.id);
+      db.prepare(`UPDATE agents SET status = 'replaced', replaced_at = ?, offline_at = ? WHERE id = ?`)
+        .run(now(), now(), old.id);
     }
 
     db.prepare(
@@ -818,20 +830,40 @@ const tools = {
       return fail(`状态流转不合法: ${task.status} → ${status}。允许的流转: ${(VALID_TRANSITIONS[task.status] || []).join(', ') || '终态，不可变更'}`);
     }
 
+    // v2.1 身份机制：任务认领绑定 + 认领互斥
+    let actor = null;
+    let actorRole = null;
+    if (from_id) {
+      actor = db.prepare(`SELECT id, name, role FROM agents WHERE id = ?`).get(from_id);
+      actorRole = actor ? actor.role : null;
+    }
+
+    // b) 认领互斥：任务已被他人认领，非认领者且非 manager 不得操作
+    if (task.assigned_id && from_id && from_id !== task.assigned_id && actorRole !== 'manager') {
+      const assignee = db.prepare(`SELECT name FROM agents WHERE id = ?`).get(task.assigned_id);
+      return fail(`任务已由 ${assignee ? assignee.name : task.assigned_id} 认领，无权操作`);
+    }
+
+    // a) 认领绑定：pending 未指定人 → 第一个把它推入 in_progress 的同角色 agent 成为认领人
+    let claimedBy = null;
+    if (!task.assigned_id && status === 'in_progress' && from_id && actorRole === task.assigned_role) {
+      claimedBy = from_id;
+    }
+
     const updates = { status, updated_at: now() };
     if (status === 'completed') updates.completed_at = now();
     if (result) updates.result = result;
 
-    db.prepare(
-      `UPDATE tasks SET status = @status, updated_at = @updated_at, 
-       completed_at = @completedAt, result = @result WHERE id = @id`
-    ).run({
-      status: updates.status,
-      updated_at: updates.updated_at,
-      completedAt: updates.completed_at || null,
-      result: updates.result || task.result,
-      id: task_id
-    });
+    if (claimedBy) {
+      db.prepare(
+        `UPDATE tasks SET status = ?, updated_at = ?, completed_at = ?, result = ?, assigned_id = ? WHERE id = ?`
+      ).run(updates.status, updates.updated_at, updates.completed_at || null, updates.result || task.result, claimedBy, task_id);
+      logEvent(task_id, 'claimed', task.status, status, from_id, actor ? actor.name : null, '任务认领绑定');
+    } else {
+      db.prepare(
+        `UPDATE tasks SET status = ?, updated_at = ?, completed_at = ?, result = ? WHERE id = ?`
+      ).run(updates.status, updates.updated_at, updates.completed_at || null, updates.result || task.result, task_id);
+    }
 
     // 获取操作者名称
     let actorName = null;
@@ -1025,8 +1057,13 @@ const tools = {
   heartbeat({ from_id, agent_id }) {
     // [2026-08-15] 兼容 agent_id 参数：部分客户端用 agent_id 调心跳，此前静默无效（code:0 但不刷新）
     const id = from_id || agent_id;
-    db.prepare(`UPDATE agents SET last_seen = ?, status = 'online' WHERE id = ?`)
-      .run(now(), id);
+    if (!id) return fail('需要 from_id');
+    // v2.1 身份机制：replaced 墓碑不可复活（last_seen 照常刷新无害）；
+    // offline（心跳超时被清扫）的 agent 允许复活为 online（保留 2cfe52d 语义）
+    const r = db.prepare(
+      `UPDATE agents SET last_seen = ?, status = CASE WHEN status = 'replaced' THEN status ELSE 'online' END WHERE id = ?`
+    ).run(now(), id);
+    if (r.changes === 0) return fail('agent不存在，请先register');
     return ok({});
   }
 };
@@ -1046,7 +1083,7 @@ app.get('/health', (req, res) => {
     epics: db.prepare(`SELECT COUNT(*) as c FROM epics`).get().c,
     projects: db.prepare(`SELECT COUNT(DISTINCT project) as c FROM agents WHERE status = 'online'`).get().c
   };
-  res.json(ok({ status: 'running', version: '2.0.0', uptime: process.uptime(), ...counts }));
+  res.json(ok({ status: 'running', version: '2.1.0', uptime: process.uptime(), ...counts }));
 });
 
 // MCP 协议: 列出工具
@@ -1097,7 +1134,10 @@ app.get('/api/messages/:agent_id', authMiddleware, (req, res) => {
   try {
     const agentId = req.params.agent_id;
     // [2026-08-15] 拉消息视同心跳：agent 持续轮询收件箱 = 存活证据，刷新 last_seen 防止被5分钟清扫误判掉线
-    db.prepare(`UPDATE agents SET last_seen = ?, status = 'online' WHERE id = ?`).run(now(), agentId);
+    // v2.1 身份机制：被替换（replaced 墓碑）的旧身份不可借轮询复活；offline（超时）仍可复活（保留 2cfe52d 语义）
+    db.prepare(
+      `UPDATE agents SET last_seen = ?, status = CASE WHEN status = 'replaced' THEN status ELSE 'online' END WHERE id = ?`
+    ).run(now(), agentId);
     const all = req.query.all === 'true';
 
     // 向后兼容：无 wait 参数，走原有同步逻辑
@@ -1325,6 +1365,7 @@ setInterval(() => {
   ).all(cutoff);
   for (const a of stale) closeSseForAgent(a.id);
 
+  // v2.1 身份机制：不碰 replaced 墓碑（终态），只把真超时的 online 置 offline
   db.prepare(`UPDATE agents SET status = 'offline', offline_at = ? WHERE status = 'online' AND last_seen < ?`)
     .run(now(), cutoff);
   log('debug', 'Heartbeat check completed');
@@ -1332,7 +1373,7 @@ setInterval(() => {
 
 // ---------- 启动 ----------
 app.listen(PORT, '0.0.0.0', () => {
-  log('info', `Agent Hub v2.0.0 running on port ${PORT}`);
+  log('info', `Agent Hub v2.1.0 running on port ${PORT}`);
   log('info', `Health: http://localhost:${PORT}/health`);
   log('info', `MCP Tools: http://localhost:${PORT}/mcp/tools`);
   log('info', `State Machine: http://localhost:${PORT}/api/state-machine`);
