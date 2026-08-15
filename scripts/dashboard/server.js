@@ -80,12 +80,26 @@ let lastGoodAt = null;
 async function buildOverview() {
   const [healthRes, agentsRes, ...taskResList] = await Promise.all([
     hubGet('/health').catch(() => null),
-    hubGet('/api/agents?project=yiyuan').catch(() => null),
+    // online_only=false 拉全部（含 offline/replaced），hub端已修字符串'false'恒真的bug
+    hubGet('/api/agents?project=yiyuan&online_only=false').catch(() => null),
     ...ALL_STATUSES.map((s) => hubGet(`/api/tasks?project=yiyuan&status=${s}`).catch(() => null)),
   ]);
 
-  const agents = (agentsRes && agentsRes.data && agentsRes.data.agents) || [];
-  const nameMap = buildAgentNameMap(agents);
+  const allAgents = (agentsRes && agentsRes.data && agentsRes.data.agents) || [];
+  const nameMap = buildAgentNameMap(allAgents);
+
+  // 按角色取"最新一代"agent（online优先，其次最近下线的；replaced墓碑是历史代，不展示）
+  const latestByRole = {};
+  for (const a of allAgents) {
+    if (a.status === 'replaced') continue;
+    const cur = latestByRole[a.role];
+    if (!cur || (cur.status !== 'online' && a.status === 'online')) latestByRole[a.role] = a;
+  }
+  // online 一律覆盖为当前代（在线者就是最新身份）
+  for (const a of allAgents) {
+    if (a.status === 'online') latestByRole[a.role] = a;
+  }
+  const agents = Object.values(latestByRole);
 
   const byStatus = {};
   ALL_STATUSES.forEach((s, i) => {
@@ -109,12 +123,20 @@ async function buildOverview() {
 
   const health = healthRes && healthRes.data ? healthRes.data : null;
 
+  // 三态：离线 / 空闲(在线无任务) / 忙碌中(在线且有活跃任务)
+  const busySet = new Set(activeTasks.filter((t) => t.assigned_id).map((t) => t.assigned_id));
+  const agentsWithState = agents.map((a) => ({
+    ...a,
+    state: a.status === 'online' ? (busySet.has(a.id) ? 'busy' : 'idle') : 'offline',
+    activeTaskTitles: activeTasks.filter((t) => t.assigned_id === a.id).map((t) => t.title),
+  }));
+
   // 任务执行者名映射（含 events actor 由前端惰性拉取时用 nameMap）
   const overview = {
     serverTime: new Date().toISOString(),
     hubBase: HUB_BASE,
     health,
-    agents,
+    agents: agentsWithState,
     activeTasks,
     historyTasks,
     taskStats,

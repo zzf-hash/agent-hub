@@ -1362,7 +1362,12 @@ app.get('/api/epics', authMiddleware, (req, res) => {
 });
 
 app.get('/api/agents', authMiddleware, (req, res) => {
-  try { res.json(ok(tools.list_agents(req.query))); }
+  try {
+    // query参数是字符串：'false'字符串为truthy会导致online_only永远生效，这里显式转布尔
+    const q = { ...req.query };
+    if (q.online_only !== undefined) q.online_only = String(q.online_only) !== 'false';
+    res.json(ok(tools.list_agents(q)));
+  }
   catch (err) { res.status(500).json(fail(err.message)); }
 });
 
