@@ -1109,7 +1109,7 @@ app.get('/health', (req, res) => {
     epics: db.prepare(`SELECT COUNT(*) as c FROM epics`).get().c,
     projects: db.prepare(`SELECT COUNT(DISTINCT project) as c FROM agents WHERE status = 'online'`).get().c
   };
-  res.json(ok({ status: 'running', version: '2.1.0', uptime: process.uptime(), ...counts }));
+  res.json(ok({ status: 'running', version: '2.1.1', uptime: process.uptime(), ...counts }));
 });
 
 // MCP 协议: 列出工具
@@ -1399,7 +1399,7 @@ setInterval(() => {
 
 // ---------- 启动 ----------
 app.listen(PORT, '0.0.0.0', () => {
-  log('info', `Agent Hub v2.1.0 running on port ${PORT}`);
+  log('info', `Agent Hub v2.1.1 running on port ${PORT}`);
   log('info', `Health: http://localhost:${PORT}/health`);
   log('info', `MCP Tools: http://localhost:${PORT}/mcp/tools`);
   log('info', `State Machine: http://localhost:${PORT}/api/state-machine`);
