@@ -925,7 +925,7 @@ const tools = {
     return { tasks: rows };
   },
 
-  update_task({ task_id, from_id, status, result = '' }) {
+  update_task({ task_id, from_id, status, result = '', override }) {
     const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(task_id);
     if (!task) return fail('任务不存在');
 
@@ -943,6 +943,26 @@ const tools = {
       // v2.1.1 僵尸守卫：被替换（replaced）的旧身份不得再操作任务（残留进程自我复活的最后一道闸）
       if (actor && actor.status === 'replaced') {
         return fail(`身份已被新会话替换（replaced），请重新 register 获取新 agent_id`);
+      }
+    }
+
+    // 🔴 v2.4 审核闸门（四色任务 3485f9b7 教训：backend 9秒内自审自批 in_review→testing→test_passed→completed）
+    // in_review 之后的推进流转（testing/test_passed/test_failed/completed）只允许：
+    //   1. manager（PM 审核职责）
+    //   2. QA 对 task_type=test 的任务（testing→test_passed/test_failed 本就是 QA 的活）
+    //   3. override==='boss'：老板明确授权跳过 QA/代行审核时使用（result 里注明授权来源）
+    // 普通认领互斥仍然先行：manager 本来就不受认领互斥限制。
+    if (task.status === 'in_review' || task.status === 'testing' || task.status === 'test_passed') {
+      const FORWARD_STATES = ['testing', 'test_passed', 'test_failed', 'completed'];
+      if (FORWARD_STATES.includes(status) && actorRole !== 'manager') {
+        const isQaTestFlow = actorRole === 'qa' && task.task_type === 'test';
+        if (!isQaTestFlow && override !== 'boss') {
+          return fail(`权限不足：in_review 后的推进流转（${task.status} → ${status}）只允许 manager 操作${task.task_type === 'test' ? '（QA 限 test 任务）' : ''}。dev 任务请在 in_review 停手等待 PM 审核；老板授权时传 override:'boss' 并在 result 注明`);
+        }
+        if (isQaTestFlow || override === 'boss') {
+          logEvent(task_id, 'gate_pass', task.status, status, from_id, actor ? actor.name : null,
+            override === 'boss' ? `审核闸门放行：老板授权（override:boss），操作者 ${actor ? actor.name : from_id}` : `审核闸门放行：QA test 任务流转`);
+        }
       }
     }
 
@@ -1004,6 +1024,19 @@ const tools = {
 
     // 记录事件
     logEvent(task_id, 'status_change', task.status, status, from_id, actorName, result);
+
+    // 🔴 v2.4 交付必达（四色任务教训：submit 只写库不叫人，PM 收件箱 0 条，老板不看面板不知道）
+    // dev 任务提交 in_review = 等人审，必须主动叫 PM + 老板；completed 同理（防 QA/manager 完结后无人知晓）。
+    // PM 站内信走 notifyRole('manager')（在线即时+离线存悬空消息）。
+    if (status === 'in_review') {
+      notifyRole('manager', task.project,
+        `📨 待审核: ${task.title}\n提交人: ${actorName || task.assigned_id || '未知'}\n任务ID: ${task_id.slice(0, 8)}\n${result ? '交付摘要: ' + String(result).slice(0, 200) : '（无 result）'}\n→ 请 PM 审核（approve 进 testing / reject 打回）`);
+      notifyBoss('agenthub.task',
+        `📨 任务待审核\n\n📋 ${task.title}\n👤 提交人: ${actorName || '未知'}\n📝 ${result ? String(result).slice(0, 300) : '无交付摘要'}\n→ 等 PM 审核，审核结果会另行通知`);
+    } else if (status === 'completed') {
+      notifyBoss('agenthub.task',
+        `🏁 任务完结\n\n📋 ${task.title}\n👤 操作人: ${actorName || '未知'}\n→ 已进入 completed 终态`);
+    }
 
     // 通知创建者
     if (task.created_by && from_id !== task.created_by) {
@@ -1375,6 +1408,13 @@ const tools = {
     const row = db.prepare(`SELECT * FROM agent_work WHERE id = ?`).get(work_id);
     emitWorkEvent('work_finished', row);
     log('info', `agent_work: work finished`, { work_id, agent_id: work.agent_id, source: work.source });
+
+    // 🔴 v2.4 交付必达：external 工作完结主动通知老板（hub 任务走任务状态流转，已有 in_review/completed 通知，不重复）
+    if (work.source === 'external') {
+      const wAgent = db.prepare(`SELECT name FROM agents WHERE id = ?`).get(work.agent_id);
+      notifyBoss('agenthub.task',
+        `🏁 外部工作完结\n\n📋 ${work.title}\n👤 执行者: ${wAgent ? wAgent.name : work.agent_id}\n📝 ${note ? String(note).slice(0, 200) : '无备注'}\n→ 该工作经 work/finish 上报完结（非 hub 任务）`);
+    }
     return { work_id, status: 'done' };
   },
 
@@ -1408,7 +1448,7 @@ app.get('/health', (req, res) => {
     epics: db.prepare(`SELECT COUNT(*) as c FROM epics`).get().c,
     projects: db.prepare(`SELECT COUNT(DISTINCT project) as c FROM agents WHERE status = 'online'`).get().c
   };
-  res.json(ok({ status: 'running', version: '2.3.1', uptime: process.uptime(), ...counts }));
+  res.json(ok({ status: 'running', version: '2.4.0', uptime: process.uptime(), ...counts }));
 });
 
 // MCP 协议: 列出工具
