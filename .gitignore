@@ -6,3 +6,14 @@ db.sqlite-shm
 public/*.msi
 agent_hub.db
 *.db
+
+# 敏感/运行时文件（真实文件只在服务器上）
+.agenthub_token
+*.sqlite*
+agent_hub.db
+logs/
+*.log
+*.bak
+server.js.*.bak
+.env*
+config.yaml

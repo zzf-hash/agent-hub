@@ -115,3 +115,11 @@ POST /mcp/tools/heartbeat { "from_id": "你的agent_id" }
 ## 安全
 
 生产环境在 `config.yaml` 设置 `auth_token`，所有请求需带 `x-auth-token` 头。
+
+
+## 备份说明（v2.0.0 起）
+
+本仓库是生产服务器(43.155.210.25)部署目录的备份镜像。**真实密钥只存在于服务器上的 `config.yaml` 与 `.agenthub_token`**，仓库中仅提供脱敏模板 `config.example.yaml`。数据库文件(db.sqlite等)不入库。
+
+- 线上运行：pm2 `agent-hub`，部署路径 `/home/agentuser/agent-hub`，端口 8100
+- v2.0.0 多Agent审批流工作流引擎源码于 2026-08-15 从该部署目录同步

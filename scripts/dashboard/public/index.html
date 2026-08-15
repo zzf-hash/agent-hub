@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentHub 监控面板</title>
+<style>
+:root{
+  --bg:#0d1117;--panel:#161b22;--panel2:#1c2129;--border:#30363d;
+  --text:#e6edf3;--dim:#8b949e;--dimmer:#6e7681;
+  --green:#3fb950;--red:#f85149;--yellow:#d29922;--blue:#58a6ff;--purple:#bc8cff;--orange:#f0883e;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:14px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;padding:16px;max-width:1200px;margin:0 auto}
+h1{font-size:18px;margin-bottom:4px}
+.topbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block;flex:none}
+.dot.ok{background:var(--green);box-shadow:0 0 6px var(--green)}
+.dot.bad{background:var(--red);box-shadow:0 0 6px var(--red)}
+.ts{color:var(--dim);font-size:12px}
+.banner{background:#3d1e1e;border:1px solid var(--red);color:#ffb0aa;border-radius:8px;padding:8px 12px;margin-bottom:12px;font-size:13px;display:none}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:16px}
+.stat{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 14px}
+.stat .num{font-size:22px;font-weight:700}
+.stat .lbl{font-size:12px;color:var(--dim)}
+.stat.hl{border-color:var(--blue);background:#12233a}
+h2{font-size:14px;color:var(--dim);margin:18px 0 10px;text-transform:uppercase;letter-spacing:.5px}
+.agents{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}
+.acard{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px}
+.acard .name{font-weight:600}
+.acard .role{color:var(--purple);font-size:12px}
+.acard .cap{color:var(--dim);font-size:12px;margin-top:4px;word-break:break-all}
+.acard .seen{color:var(--dimmer);font-size:12px;margin-top:4px}
+.tabs{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap}
+.tab{background:var(--panel);border:1px solid var(--border);color:var(--dim);border-radius:20px;padding:4px 14px;cursor:pointer;font-size:13px}
+.tab.on{color:var(--text);border-color:var(--blue);background:#12233a}
+.task{background:var(--panel);border:1px solid var(--border);border-radius:10px;margin-bottom:8px;overflow:hidden}
+.trow{display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:pointer;flex-wrap:wrap}
+.trow:hover{background:var(--panel2)}
+.badge{font-size:11px;padding:2px 8px;border-radius:10px;flex:none;white-space:nowrap}
+.b-pending{background:#2d333b;color:var(--dim)}
+.b-in_progress{background:#1f3a5f;color:var(--blue)}
+.b-in_review{background:#3d2f00;color:var(--yellow)}
+.b-testing{background:#2a1f3d;color:var(--purple)}
+.b-test_failed,.b-rejected{background:#3d1e1e;color:var(--red)}
+.b-completed,.b-test_passed{background:#1a3325;color:var(--green)}
+.b-cancelled{background:#2d333b;color:var(--dimmer)}
+.pri{font-size:11px;font-weight:700;color:var(--red);flex:none}
+.ttitle{flex:1;min-width:200px}
+.tmeta{color:var(--dimmer);font-size:12px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.copy{cursor:pointer;color:var(--blue);font-size:11px}
+.detail{border-top:1px solid var(--border);padding:12px;background:var(--panel2);font-size:13px}
+.detail pre{background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:10px;white-space:pre-wrap;word-break:break-word;font-size:12px;margin:6px 0;max-height:400px;overflow:auto}
+.kv{color:var(--dim);font-size:12px;margin-bottom:6px}
+.result-block pre{color:#7ee787}
+.review-pass{color:var(--green)} .review-rej{color:var(--red)}
+.timeline{margin-top:8px}
+.timeline .ev{display:flex;gap:10px;padding:5px 0;border-left:2px solid var(--border);padding-left:12px;margin-left:6px;position:relative;font-size:12px}
+.timeline .ev::before{content:'';position:absolute;left:-5px;top:11px;width:8px;height:8px;border-radius:50%;background:var(--dim)}
+.timeline .ev.now::before{background:var(--green)}
+.empty{color:var(--dimmer);text-align:center;padding:30px}
+@media(max-width:600px){body{padding:10px}.stat .num{font-size:18px}}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <h1>🛰 AgentHub 监控面板</h1>
+  <span class="dot ok" id="hubDot"></span>
+  <span class="ts" id="hubTs">连接中…</span>
+</div>
+<div class="banner" id="banner"></div>
+
+<div class="stats" id="stats"></div>
+
+<h2>Agents 在线</h2>
+<div class="agents" id="agents"></div>
+
+<h2>任务</h2>
+<div class="tabs">
+  <div class="tab on" data-tab="active">进行中</div>
+  <div class="tab" data-tab="done">已完成</div>
+  <div class="tab" data-tab="rejected">已驳回</div>
+</div>
+<div id="tasks"></div>
+
+<script>
+'use strict';
+const $ = (s)=>document.querySelector(s);
+const esc = (s)=>String(s==null?'':s).replace(/[&<>"']/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function relTime(iso){
+  if(!iso) return '';
+  const t = new Date(iso.includes('T')?iso:iso.replace(' ','T')+'Z').getTime();
+  if(isNaN(t)) return iso;
+  const d = Date.now()-t;
+  if(d<0) return iso;
+  if(d<10e3) return '刚刚';
+  if(d<60e3) return Math.floor(d/1e3)+'秒前';
+  if(d<3600e3) return Math.floor(d/60e3)+'分钟前';
+  if(d<86400e3) return Math.floor(d/3600e3)+'小时前';
+  return Math.floor(d/86400e3)+'天前';
+}
+
+const STATUS_TXT = {pending:'待领取',in_progress:'进行中',in_review:'待审核',testing:'测试中',test_failed:'测试失败',test_passed:'测试通过',completed:'已完成',rejected:'已驳回',cancelled:'已取消'};
+
+let ov=null, curTab='active', expanded=new Set(), evCache={};
+
+function renderStats(){
+  const s=ov.taskStats, a=ov.agents.length;
+  const cards=[{num:a,lbl:'在线 Agent',hl:true}];
+  for(const k of ['pending','in_progress','in_review','testing','test_failed'])
+    if(s[k]) cards.push({num:s[k],lbl:STATUS_TXT[k],hl:true});
+  for(const k of ['completed','rejected','cancelled'])
+    if(s[k]) cards.push({num:s[k],lbl:STATUS_TXT[k]});
+  $('#stats').innerHTML = cards.map(c=>`<div class="stat${c.hl?' hl':''}"><div class="num">${c.num}</div><div class="lbl">${c.lbl}</div></div>`).join('');
+}
+
+function renderAgents(){
+  const el=$('#agents');
+  if(!ov.agents.length){ el.innerHTML='<div class="empty">无在线 agent</div>'; return; }
+  el.innerHTML = ov.agents.map(a=>`
+    <div class="acard">
+      <div><span class="dot ok" style="margin-right:6px"></span><span class="name">${esc(a.name)}</span> <span class="role">${esc(a.role)}</span></div>
+      ${a.capabilities?`<div class="cap">${esc(a.capabilities)}</div>`:''}
+      <div class="seen">seen ${relTime(a.last_seen)}</div>
+    </div>`).join('');
+}
+
+function taskList(){
+  if(curTab==='active') return ov.activeTasks;
+  if(curTab==='done') return ov.historyTasks.filter(t=>t.status==='completed'||t.status==='test_passed');
+  return ov.historyTasks.filter(t=>t.status==='rejected');
+}
+
+function renderTasks(){
+  const el=$('#tasks');
+  const list=taskList();
+  if(!list.length){ el.innerHTML='<div class="empty">暂无任务</div>'; return; }
+  el.innerHTML = list.map(t=>{
+    const id8=t.id.slice(0,8);
+    const open=expanded.has(t.id);
+    return `<div class="task" id="task-${id8}">
+      <div class="trow" onclick="toggleDetail('${t.id}')">
+        <span class="badge b-${t.status}">${STATUS_TXT[t.status]||t.status}</span>
+        ${t.priority==='urgent'?'<span class="pri">urgent</span>':(t.priority==='high'?'<span class="pri" style="color:var(--orange)">high</span>':'')}
+        <span class="ttitle">${esc(t.title)}</span>
+        <span class="tmeta"><span class="copy" onclick="event.stopPropagation();copyId('${id8}')" title="点击复制">${id8}</span>
+        ${t.assigned_role?`<span>${esc(t.assigned_role)}</span>`:''}
+        <span>${relTime(t.updated_at||t.created_at)}</span></span>
+      </div>
+      ${open?detailHtml(t):''}
+    </div>`;
+  }).join('');
+  // 展开的详情补加载 events
+  for(const id of expanded){ if(!evCache[id]) loadEvents(id); }
+}
+
+function detailHtml(t){
+  const rs=t.review_status;
+  let review='';
+  if(rs==='approved') review=`<div class="kv">审核：<span class="review-pass">✅ 通过</span></div>`;
+  else if(rs==='rejected') review=`<div class="kv">审核：<span class="review-rej">❌ 驳回</span></div>`;
+  else if(rs) review=`<div class="kv">审核：${esc(rs)}</div>`;
+  if(t.review_comment) review+=`<div class="kv">审核意见：<pre>${esc(t.review_comment)}</pre></div>`;
+  return `<div class="detail">
+    <div class="kv">ID: ${esc(t.id)}</div>
+    <div class="kv">描述：</div><pre>${esc(t.description)}</pre>
+    ${t.result?`<div class="kv result-block">执行输出：</div><pre>${esc(t.result)}</pre>`:''}
+    ${review}
+    <div class="kv">事件时间线：</div>
+    <div class="timeline" id="ev-${t.id}"><div class="kv">加载中…</div></div>
+  </div>`;
+}
+
+async function loadEvents(id){
+  evCache[id]=evCache[id]||{loading:true};
+  try{
+    const r=await fetch(`/api/task/${id}/events`).then(x=>x.json());
+    evCache[id]={events:(r.data&&r.data.events)||[]};
+  }catch(e){ evCache[id]={events:[]}; }
+  const el=document.getElementById('ev-'+id);
+  if(!el) return;
+  const evs=evCache[id].events||[];
+  if(!evs.length){ el.innerHTML='<div class="kv">无事件</div>'; return; }
+  const t0=new Date(evs[0].created_at.includes('T')?evs[0].created_at:evs[0].created_at.replace(' ','T')+'Z').getTime();
+  el.innerHTML=evs.map((e,i)=>{
+    const tc=new Date(e.created_at.includes('T')?e.created_at:e.created_at.replace(' ','T')+'Z').getTime();
+    const dur=isNaN(t0)||isNaN(tc)?'':(tc>t0?` <span style="color:var(--dimmer)">(+${Math.round((tc-t0)/1000)}秒)</span>`:'');
+    const what = e.event==='created'?`创建 → ${STATUS_TXT[e.to_status]||e.to_status||'pending'}`
+      : e.event==='status_change'?`${STATUS_TXT[e.from_status]||e.from_status||'?'} → ${STATUS_TXT[e.to_status]||e.to_status}`
+      : `${e.event} ${STATUS_TXT[e.to_status]||e.to_status||''}`;
+    return `<div class="ev${i===evs.length-1?' now':''}"><div><b>${what}</b>${dur}<br><span style="color:var(--dimmer)">${esc(e.actor_name||'')}${e.comment?` · ${esc(String(e.comment).slice(0,120))}`:''} · ${relTime(e.created_at)}</span></div></div>`;
+  }).join('');
+}
+
+function toggleDetail(id){
+  if(expanded.has(id)) expanded.delete(id); else expanded.add(id);
+  renderTasks();
+}
+function copyId(id8){
+  navigator.clipboard&&navigator.clipboard.writeText(id8);
+  event.target.textContent='已复制';
+  setTimeout(()=>{const e=document.querySelector(`.trow .copy`);},1500);
+}
+
+document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));
+  t.classList.add('on'); curTab=t.dataset.tab; renderTasks();
+}));
+
+function renderConn(){
+  const dot=$('#hubDot'), ts=$('#hubTs'), banner=$('#banner');
+  if(ov.error==='hub_unreachable'){
+    dot.className='dot bad';
+    ts.textContent=`hub 不可达 · 显示 ${relTime(new Date(ov.lastGoodAt||Date.now()).toISOString())} 前的数据`;
+    banner.style.display='block';
+    banner.textContent=`⚠ Hub 不可达（${esc(ov.hubBase)}），正在展示最后一次成功数据 ${ov.lastGoodAt||''}`;
+  }else{
+    dot.className='dot ok';
+    ts.textContent=`hub 在线 · ${relTime(ov.serverTime)}`;
+    banner.style.display='none';
+  }
+}
+
+async function refresh(){
+  try{
+    const r=await fetch('/api/overview').then(x=>x.json());
+    if(r.code===0&&r.data){ ov=r.data; ov.lastGoodAt=r.lastGoodAt||null; }
+  }catch(e){}
+  if(!ov){ $('#hubTs').textContent='等待数据…'; return; }
+  renderConn(); renderStats(); renderAgents(); renderTasks();
+}
+refresh();
+setInterval(refresh,10000);
+</script>
+</body>
+</html>
