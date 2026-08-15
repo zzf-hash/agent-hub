@@ -1022,9 +1022,11 @@ const tools = {
     return ok({});
   },
 
-  heartbeat({ from_id }) {
+  heartbeat({ from_id, agent_id }) {
+    // [2026-08-15] 兼容 agent_id 参数：部分客户端用 agent_id 调心跳，此前静默无效（code:0 但不刷新）
+    const id = from_id || agent_id;
     db.prepare(`UPDATE agents SET last_seen = ?, status = 'online' WHERE id = ?`)
-      .run(now(), from_id);
+      .run(now(), id);
     return ok({});
   }
 };
@@ -1094,6 +1096,8 @@ app.post('/api/send_message', authMiddleware, (req, res) => {
 app.get('/api/messages/:agent_id', authMiddleware, (req, res) => {
   try {
     const agentId = req.params.agent_id;
+    // [2026-08-15] 拉消息视同心跳：agent 持续轮询收件箱 = 存活证据，刷新 last_seen 防止被5分钟清扫误判掉线
+    db.prepare(`UPDATE agents SET last_seen = ?, status = 'online' WHERE id = ?`).run(now(), agentId);
     const all = req.query.all === 'true';
 
     // 向后兼容：无 wait 参数，走原有同步逻辑
