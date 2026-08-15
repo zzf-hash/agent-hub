@@ -2,7 +2,7 @@
 port: 8100
 
 # 鉴权 (留空则不鉴权，生产环境建议设置)
-auth_token: "<REDACTED-真实token只在服务器>"
+auth_token: "CHANGE_ME_auth_token（真实值只存服务器~/deploy目录与各agent本地身份文件）"
 
 # 数据库路径
 db_path: "./db.sqlite"
@@ -16,4 +16,4 @@ log_level: info
 # Hermes webhook (审核结果转发到老板微信)
 # 注意：secret 是订阅级别的（每个 webhook subscribe 生成），不是 gateway 级别的
 hermes_webhook_url: "http://localhost:8644/webhooks/agenthub-task"
-hermes_webhook_secret: "<REDACTED-真实secret只在服务器>"
+hermes_webhook_secret: "CHANGE_ME_hermes_webhook_secret（真实值只存服务器~/deploy目录与各agent本地身份文件）"

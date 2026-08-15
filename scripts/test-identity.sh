@@ -97,13 +97,43 @@ EV=$(sq "SELECT COUNT(*) FROM task_events WHERE task_id='$TASK' AND event='claim
 
 # ---------- T4 认领互斥 ----------
 section "T4 认领互斥 + manager强制流转"
-F2=$(reg agentF2 frontend)
-RESP=$(H -X PUT $BASE/api/tasks/$TASK -H 'Content-Type: application/json' -d "{\"from_id\":\"$F2\",\"status\":\"in_review\"}")
-echo "$RESP" | grep -q "已由 agentF 认领" && ok "T4a agentF2 被拒（错误信息含认领人名字）" || bad "T4a agentF2 未被正确拒绝: $RESP"
+# 注意：同项目同角色注册会顶掉旧身份（F→replaced），此时 F2 操作走“接管”而非互斥。
+# 互斥拒绝的正确场景：异角色（QA）操作仍在线认领人（agentF）的任务。
+QA=$(reg agentQA qa)
+RESP=$(H -X PUT $BASE/api/tasks/$TASK -H 'Content-Type: application/json' -d "{\"from_id\":\"$QA\",\"status\":\"in_review\"}")
+echo "$RESP" | grep -q "已由 agentF 认领" && ok "T4a QA被拒（错误信息含认领人名字）" || bad "T4a QA未被正确拒绝: $RESP"
 ST=$(sq "SELECT status FROM tasks WHERE id='$TASK'")
 [ "$ST" = "in_progress" ] && ok "T4b 任务状态未被篡改（仍 in_progress）" || bad "T4b 状态被改: $ST"
 RESP=$(H -X PUT $BASE/api/tasks/$TASK -H 'Content-Type: application/json' -d "{\"from_id\":\"$M\",\"status\":\"in_review\"}")
 echo "$RESP" | grep -q '"code":0' && ok "T4c manager 强制流转成功" || bad "T4c manager 流转失败: $RESP"
+
+# ---------- T4d/e/f 死亡身份接管 + 僵尸守卫（v2.1.1）----------
+section "T4d/e/f 死亡身份接管 + 僵尸守卫"
+# 用独立项目 yiyuan2 隔离，避免与前面的 agentF/frontend 身份链互相顶替
+RTK=$(H -X POST $BASE/api/tasks -H 'Content-Type: application/json' -d "{\"created_by\":\"$M\",\"project\":\"yiyuan2\",\"title\":\"T4d接管测试\",\"to_role\":\"frontend\"}" | jq_get data.task_id)
+FO=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"frontOld","role":"frontend","project":"yiyuan2"}' | jq_get data.agent_id)
+FN=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"frontNew","role":"frontend","project":"yiyuan2"}' | jq_get data.agent_id)
+ST=$(sq "SELECT status FROM agents WHERE id='$FO'")
+[ "$ST" = "replaced" ] && ok "T4d-0 frontOld 被 frontNew 替换为 replaced" || bad "T4d-0 frontOld状态=$ST"
+# frontOld（僵尸身份）直接操作 → 应被僵尸守卫拒绝
+RESP=$(H -X PUT $BASE/api/tasks/$RTK -H 'Content-Type: application/json' -d "{\"from_id\":\"$FO\",\"status\":\"in_progress\"}")
+echo "$RESP" | grep -q '"code":1' && ok "T4f 僵尸身份操作任务被拒" || bad "T4f 僵尸身份未被拒: $RESP"
+# frontNew（同角色新身份）认领 → 绑定（auto-bind 或 claimed/takeover 任一路径，终态都是 FN）
+H -X PUT $BASE/api/tasks/$RTK -H 'Content-Type: application/json' -d "{\"from_id\":\"$FN\",\"status\":\"in_progress\"}" > /dev/null
+AID=$(sq "SELECT assigned_id FROM tasks WHERE id='$RTK'")
+[ "$AID" = "$FN" ] && ok "T4d-1 frontNew 认领绑定" || bad "T4d-1 assigned_id=$AID（期望 $FN）"
+# 模拟历史任务：把 assigned_id 手动绑到已死的 frontOld
+node -e "const D=require('better-sqlite3');const db=new D('$DB');db.prepare(\"UPDATE tasks SET assigned_id=? WHERE id=?\").run('$FO','$RTK');"
+# 异角色（backend）不得接管死亡 assignee 的 frontend 任务
+BKO=$(H -X POST $BASE/api/register -H 'Content-Type: application/json' -d '{"name":"bkrTakeover","role":"backend","project":"yiyuan2"}' | jq_get data.agent_id)
+RESP=$(H -X PUT $BASE/api/tasks/$RTK -H 'Content-Type: application/json' -d "{\"from_id\":\"$BKO\",\"status\":\"in_review\"}")
+echo "$RESP" | grep -q '"code":1' && ok "T4e 异角色接管死亡assignee被拒" || bad "T4e 异角色未被拒: $RESP"
+# frontNew（同项目同角色）操作已死 assignee 的任务 → 接管重绑成功
+RESP=$(H -X PUT $BASE/api/tasks/$RTK -H 'Content-Type: application/json' -d "{\"from_id\":\"$FN\",\"status\":\"in_review\"}")
+AID=$(sq "SELECT assigned_id FROM tasks WHERE id='$RTK'")
+[ "$AID" = "$FN" ] && ok "T4d-2 死亡assignee被同角色接管重绑" || bad "T4d-2 接管失败 assigned_id=$AID resp=$RESP"
+EVT=$(sq "SELECT COUNT(*) FROM task_events WHERE task_id='$RTK' AND event='takeover'")
+[ "$EVT" = "1" ] && ok "T4d-3 events 有 takeover 事件" || bad "T4d-3 takeover事件数=$EVT（期望1）"
 
 # ---------- T5 回归 ----------
 section "T5 PM现有调用模式回归"

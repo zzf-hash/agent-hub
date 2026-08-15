@@ -834,14 +834,32 @@ const tools = {
     let actor = null;
     let actorRole = null;
     if (from_id) {
-      actor = db.prepare(`SELECT id, name, role FROM agents WHERE id = ?`).get(from_id);
+      actor = db.prepare(`SELECT id, name, role, project, status FROM agents WHERE id = ?`).get(from_id);
       actorRole = actor ? actor.role : null;
+      // v2.1.1 僵尸守卫：被替换（replaced）的旧身份不得再操作任务（残留进程自我复活的最后一道闸）
+      if (actor && actor.status === 'replaced') {
+        return fail(`身份已被新会话替换（replaced），请重新 register 获取新 agent_id`);
+      }
     }
 
-    // b) 认领互斥：任务已被他人认领，非认领者且非 manager 不得操作
+    // b) 认领互斥：任务已被他人认领，非认领者且非 manager 不得操作。
+    // v2.1.1 接管语义：assignee 仍 online 时严格拒（防撞车）；
+    // assignee 已死（offline/replaced/不存在）时放行同项目同角色接管重绑——
+    // 生产实证：agent 每次会话重新 register（新 uuid，旧身份 replaced），
+    // 严格比对会让历史任务绑死的旧身份永远无人能推进（QA/前端任务受害最深）。
+    let takeoverFrom = null;
     if (task.assigned_id && from_id && from_id !== task.assigned_id && actorRole !== 'manager') {
-      const assignee = db.prepare(`SELECT name FROM agents WHERE id = ?`).get(task.assigned_id);
-      return fail(`任务已由 ${assignee ? assignee.name : task.assigned_id} 认领，无权操作`);
+      const assignee = db.prepare(`SELECT id, name, status FROM agents WHERE id = ?`).get(task.assigned_id);
+      const assigneeAlive = assignee && assignee.status === 'online';
+      if (assigneeAlive) {
+        return fail(`任务已由 ${assignee.name} 认领，无权操作`);
+      }
+      // assignee 已死：同项目同角色可接管并重绑
+      if (actorRole === task.assigned_role && actor && actor.project === task.project) {
+        takeoverFrom = task.assigned_id;
+      } else {
+        return fail(`任务已由 ${assignee ? assignee.name : task.assigned_id} 认领（已离线），仅 ${task.assigned_role || '同角色'} 可接管`);
+      }
     }
 
     // a) 认领绑定：pending 未指定人 → 第一个把它推入 in_progress 的同角色 agent 成为认领人
@@ -859,6 +877,14 @@ const tools = {
         `UPDATE tasks SET status = ?, updated_at = ?, completed_at = ?, result = ?, assigned_id = ? WHERE id = ?`
       ).run(updates.status, updates.updated_at, updates.completed_at || null, updates.result || task.result, claimedBy, task_id);
       logEvent(task_id, 'claimed', task.status, status, from_id, actor ? actor.name : null, '任务认领绑定');
+    } else if (takeoverFrom) {
+      // v2.1.1 死亡身份接管：assignee 已死，重绑到当前同角色操作者
+      db.prepare(
+        `UPDATE tasks SET status = ?, updated_at = ?, completed_at = ?, result = ?, assigned_id = ? WHERE id = ?`
+      ).run(updates.status, updates.updated_at, updates.completed_at || null, updates.result || task.result, from_id, task_id);
+      const prev = db.prepare(`SELECT name FROM agents WHERE id = ?`).get(takeoverFrom);
+      logEvent(task_id, 'takeover', task.status, status, from_id, actor ? actor.name : null,
+        `接管已离线认领人 ${prev ? prev.name : takeoverFrom}，assigned_id 重绑`);
     } else {
       db.prepare(
         `UPDATE tasks SET status = ?, updated_at = ?, completed_at = ?, result = ? WHERE id = ?`
