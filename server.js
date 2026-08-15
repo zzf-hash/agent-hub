@@ -174,6 +174,32 @@ try {
   log('info', `Migration: added column replaced_at to agents`);
 } catch (e) { /* 列已存在，跳过 */ }
 
+// v2.3 agent_work 工作追踪表（任务 933e16a3）：
+// 记录 agent 正在执行的所有工作——两类来源：
+//   source='hub'：update_task 推入 in_progress 时自动 INSERT（agent 零负担）
+//   source='external'：老板在其它渠道派活，agent 通过 /api/agents/:id/work/start 上报
+// 状态机：active → done（finish 或任务离开 in_progress）；active → stale（失联判定）→ active（复活拉回）
+db.exec(`
+  CREATE TABLE IF NOT EXISTS agent_work (
+    id           TEXT PRIMARY KEY,
+    agent_id     TEXT NOT NULL,
+    project      TEXT NOT NULL,
+    title        TEXT NOT NULL,
+    source       TEXT NOT NULL DEFAULT 'external',   -- 'hub' | 'external'
+    hub_task_id  TEXT DEFAULT NULL,                  -- source='hub' 时对应的任务ID
+    progress     INTEGER DEFAULT NULL,               -- 0-100，仅 external 使用（hub 不伪造百分比）
+    status       TEXT NOT NULL DEFAULT 'active',     -- 'active' | 'done' | 'stale'
+    note         TEXT DEFAULT '',
+    started_at   TEXT DEFAULT (datetime('now')),
+    updated_at   TEXT DEFAULT (datetime('now')),
+    finished_at  TEXT DEFAULT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_work_agent ON agent_work(agent_id);
+  CREATE INDEX IF NOT EXISTS idx_work_project ON agent_work(project);
+  CREATE INDEX IF NOT EXISTS idx_work_status ON agent_work(status);
+  CREATE INDEX IF NOT EXISTS idx_work_hub_task ON agent_work(hub_task_id);
+`);
+
 // ---------- 工具函数 ----------
 function now() { return new Date().toISOString(); }
 
@@ -327,6 +353,58 @@ function notifyRole(role, project, content) {
        VALUES (?, ?, 'system', 'AgentHub', ?, ?)`
     ).run(uuidv4(), project, role, content);
   }
+}
+
+// ---------- v2.3 agent_work 工作追踪（任务 933e16a3） ----------
+// hub 任务自动追踪 + 外部任务上报 + stale 失联判定 共用的底层操作。
+// 设计要点：
+//   - hub 工作项锚定 (hub_task_id, agent_id)：任务进入 in_progress 建 active 项，
+//     离开 in_progress 关项置 done；rejected 退回后重新认领会生成新工作项（历史保留可追溯）。
+//   - external 工作项锚定 (agent_id, title) 幂等：同 agent 同 title 已有 active → 复用更新。
+//   - 失联判定不新建定时器，搭 60s 心跳清扫器的车（见文件底部）。
+
+// 任务进入 in_progress：无该任务 active 工作项则自动 INSERT（幂等）
+function startHubWork(agentId, project, taskId, title) {
+  if (!agentId || !taskId) return;
+  const exist = db.prepare(
+    `SELECT id FROM agent_work WHERE hub_task_id = ? AND agent_id = ? AND status = 'active'`
+  ).get(taskId, agentId);
+  if (exist) return;
+  db.prepare(
+    `INSERT INTO agent_work (id, agent_id, project, title, source, hub_task_id, status, started_at, updated_at)
+     VALUES (?, ?, ?, ?, 'hub', ?, 'active', ?, ?)`
+  ).run(uuidv4(), agentId, project, title, taskId, now(), now());
+  log('info', `agent_work: hub work started`, { agent_id: agentId, hub_task_id: taskId });
+}
+
+// 任务离开 in_progress：该任务全部 active hub 工作项置 done（含接管重绑后的旧认领人项）
+function finishHubWork(taskId) {
+  if (!taskId) return;
+  const r = db.prepare(
+    `UPDATE agent_work SET status = 'done', finished_at = ?, updated_at = ? WHERE hub_task_id = ? AND source = 'hub' AND status = 'active'`
+  ).run(now(), now(), taskId);
+  if (r.changes > 0) log('info', `agent_work: hub work finished`, { hub_task_id: taskId, closed: r.changes });
+}
+
+// external 工作项幂等锚点：同 agent 同 title 的 active 项
+function findActiveExternalByTitle(agentId, title) {
+  return db.prepare(
+    `SELECT * FROM agent_work WHERE agent_id = ? AND source = 'external' AND title = ? AND status IN ('active','stale')`
+  ).get(agentId, title);
+}
+
+// agent 复活（心跳/拉消息/update 上报）时拉回其全部 stale 工作项
+function reviveStaleWorks(agentId) {
+  const r = db.prepare(
+    `UPDATE agent_work SET status = 'active', updated_at = ? WHERE agent_id = ? AND status = 'stale'`
+  ).run(now(), agentId);
+  if (r.changes > 0) log('info', `agent_work: stale works revived`, { agent_id: agentId, revived: r.changes });
+}
+
+// SSE 工作项事件推送（dashboard 实时刷新用，Phase1 简化：随 EVT_TASK 全局广播）
+function emitWorkEvent(type, workRow) {
+  if (!workRow) return;
+  hubEvents.emit(EVT_TASK, { type, work: workRow });
 }
 
 // ---------- 老板通知 (通过 Hermes webhook → 微信) ----------
@@ -483,11 +561,29 @@ function orchestrate(taskId, newStatus, actorId) {
       notifyRole('manager', task.project, `🎉 Epic "${epic.title}" 测试通过！可以推进下一步了`);
       notifyBoss('agenthub.test', `🎉 测试通过\n\n📋 需求: ${epic.title}\n→ 全部子任务完成，可以推进下一阶段`);
       // 把同 epic 的所有 dev 任务也标记为 completed
-      db.prepare(
+      const closed = db.prepare(
         `UPDATE tasks SET status = 'completed', completed_at = ?, updated_at = ? WHERE epic_id = ? AND task_type = 'dev' AND status != 'completed'`
       ).run(now(), now(), task.epic_id);
+      if (closed.changes > 0) {
+        // v2.3：编排旁路批量完成的任务，hub 工作项一并收口
+        const tids = db.prepare(
+          `SELECT id FROM tasks WHERE epic_id = ? AND task_type = 'dev' AND status = 'completed'`
+        ).all(task.epic_id).map((r) => r.id);
+        finishHubWorkForTasks(tids);
+      }
     }
   }
+}
+
+// ---------- v2.3 编排旁路：orchestrate 场景3 直接 UPDATE tasks 绕过 update_task ----------
+// 该路径把 dev 任务批量置 completed 但不经过 update_task，hub 工作项会滞留 active。
+// 这里补一个收口：凡被批量完成的任务，其 active hub 工作项一并关闭。
+function finishHubWorkForTasks(taskIds) {
+  if (!taskIds || !taskIds.length) return;
+  const stmt = db.prepare(
+    `UPDATE agent_work SET status = 'done', finished_at = ?, updated_at = ? WHERE hub_task_id = ? AND source = 'hub' AND status = 'active'`
+  );
+  for (const tid of taskIds) stmt.run(now(), now(), tid);
 }
 
 // ---------- MCP 工具定义 ----------
@@ -913,6 +1009,16 @@ const tools = {
 
     log('info', `Task updated`, { task_id, from: task.status, to: status });
 
+    // v2.3 hub 任务自动追踪（agent 零负担）：
+    //   进入 in_progress → 为当前持有人（重绑后的 assigned_id）建 active 工作项
+    //   离开 in_progress → 关闭该任务全部 active hub 工作项（rejected 重新认领会生成新工作项）
+    const holder = claimedBy || (takeoverFrom ? from_id : task.assigned_id);
+    if (status === 'in_progress') {
+      startHubWork(holder, task.project, task_id, task.title);
+    } else if (task.status === 'in_progress') {
+      finishHubWork(task_id);
+    }
+
     // [Phase1] SSE 推送任务状态变化
     emitTaskEvent('task_status_changed', {
       id: task_id, project: task.project, title: task.title,
@@ -1075,9 +1181,11 @@ const tools = {
     const rows = db.prepare(sql).all(...params);
 
     // v2.2 四态派生字段（仅 online_only=false 全量查询时附加，兼容现有调用方）：
-    // active_task_count: 该 agent 认领的 in_progress 任务数
-    // pending_task_count: 直接指派待接取(pending+assigned_id) + 角色队列(assigned_id IS NULL 且 assigned_role 匹配)
-    // display_state: offline | online_idle | online_busy（replaced 行照常返回，display_state 置 'replaced'）
+    // v2.3 修订（任务 933e16a3）：任务中 = status='online' 且 active 工作项>0（hub 或 external 均算）。
+    //   active_task_count: 该 agent 认领的 in_progress 任务数（保留：任务视角）
+    //   active_work_count / hub_active_count / external_active_count: 工作项视角（busy 派生用）
+    //   pending_task_count: 直接指派待接取(pending+assigned_id) + 角色队列(assigned_id IS NULL 且 assigned_role 匹配)
+    //   display_state: offline | online_idle | online_busy（replaced 行照常返回，display_state 置 'replaced'）
     if (!online_only) {
       const activeMap = new Map();
       db.prepare(
@@ -1091,6 +1199,15 @@ const tools = {
       const rolePendingRows = db.prepare(
         `SELECT assigned_role, project, COUNT(*) as c FROM tasks WHERE status = 'pending' AND assigned_id IS NULL AND assigned_role IS NOT NULL GROUP BY assigned_role, project`
       ).all();
+      // v2.3：active 工作项计数（hub / external 分开）
+      const hubWorkMap = new Map();
+      const extWorkMap = new Map();
+      db.prepare(
+        `SELECT agent_id, source, COUNT(*) as c FROM agent_work WHERE status = 'active' GROUP BY agent_id, source`
+      ).all().forEach((r) => {
+        const m = r.source === 'hub' ? hubWorkMap : extWorkMap;
+        m.set(r.agent_id, (m.get(r.agent_id) || 0) + r.c);
+      });
 
       for (const row of rows) {
         const active = activeMap.get(row.id) || 0;
@@ -1098,12 +1215,18 @@ const tools = {
         const pendingQueue = rolePendingRows
           .filter((r) => r.project === row.project && r.assigned_role === row.role)
           .reduce((s, r) => s + r.c, 0);
+        const hubActive = hubWorkMap.get(row.id) || 0;
+        const extActive = extWorkMap.get(row.id) || 0;
+        const activeWork = hubActive + extActive;
         row.active_task_count = active;
+        row.active_work_count = activeWork;
+        row.hub_active_count = hubActive;
+        row.external_active_count = extActive;
         row.pending_task_count = pendingAssigned + pendingQueue;
         row.display_state = row.status === 'replaced'
           ? 'replaced'
           : row.status === 'online'
-            ? (active > 0 ? 'online_busy' : 'online_idle')
+            ? (activeWork > 0 ? 'online_busy' : 'online_idle')
             : 'offline';
       }
     }
@@ -1139,7 +1262,122 @@ const tools = {
       `UPDATE agents SET last_seen = ?, status = CASE WHEN status = 'replaced' THEN status ELSE 'online' END WHERE id = ?`
     ).run(now(), id);
     if (r.changes === 0) return fail('agent不存在，请先register');
+    // v2.3：心跳复活时拉回其全部 stale 工作项（失联判定解除）
+    reviveStaleWorks(id);
     return ok({});
+  },
+
+  // ============ v2.3 外部任务上报（任务 933e16a3）============
+  // 语义：agent 在 hub 之外的任何渠道接活（老板直聊、群派活等），也必须上报到 hub，
+  // 让面板 busy 状态与真实工作一致。生命周期：start → update → finish。
+
+  // POST /api/agents/:id/work/start {from_id, title, note?, ref?}
+  work_start({ agent_id, from_id, title, note, ref }) {
+    const agent = db.prepare(`SELECT * FROM agents WHERE id = ?`).get(agent_id);
+    if (!agent) return fail('agent 不存在');
+    if (!title || !String(title).trim()) return fail('需要 title（工作标题）');
+
+    // 鉴权：from_id 必须是该 agent 本人或 manager
+    const actor = from_id ? db.prepare(`SELECT id, role FROM agents WHERE id = ?`).get(from_id) : null;
+    if (!actor) return fail('需要 from_id（操作者身份）');
+    if (from_id !== agent_id && actor.role !== 'manager') {
+      return fail('越权：只有 agent 本人或 manager 可以上报该 agent 的工作');
+    }
+    // replaced 僵尸守卫：被替换身份不得再上报工作
+    if (agent.status === 'replaced') return fail('该身份已被替换（replaced 终态），不可上报工作');
+
+    const t = String(title).trim();
+    // 幂等：同 agent 同 title 已有 active/stale external 项 → 复用并更新（拉回 active）
+    const exist = findActiveExternalByTitle(agent_id, t);
+    if (exist) {
+      db.prepare(
+        `UPDATE agent_work SET status = 'active', note = ?, updated_at = ? WHERE id = ?`
+      ).run(note != null ? String(note) : exist.note, now(), exist.id);
+      const row = db.prepare(`SELECT * FROM agent_work WHERE id = ?`).get(exist.id);
+      emitWorkEvent('work_updated', row);
+      return { work_id: exist.id, reused: true };
+    }
+
+    const id = uuidv4();
+    db.prepare(
+      `INSERT INTO agent_work (id, agent_id, project, title, source, hub_task_id, progress, status, note, started_at, updated_at)
+       VALUES (?, ?, ?, ?, 'external', NULL, NULL, 'active', ?, ?, ?)`
+    ).run(id, agent_id, agent.project, t, ref ? `ref: ${ref}` : (note || ''), now(), now());
+    const row = db.prepare(`SELECT * FROM agent_work WHERE id = ?`).get(id);
+    emitWorkEvent('work_started', row);
+    log('info', `agent_work: external work started`, { agent_id, work_id: id, title: t });
+    return { work_id: id, reused: false };
+  },
+
+  // POST /api/work/:work_id/update {from_id, progress?, note?}
+  work_update({ work_id, from_id, progress, note }) {
+    const work = db.prepare(`SELECT * FROM agent_work WHERE id = ?`).get(work_id);
+    if (!work) return fail('work 不存在');
+
+    const actor = from_id ? db.prepare(`SELECT id, role FROM agents WHERE id = ?`).get(from_id) : null;
+    if (!actor) return fail('需要 from_id（操作者身份）');
+    if (from_id !== work.agent_id && actor.role !== 'manager') {
+      return fail('越权：只有 agent 本人或 manager 可以更新该工作');
+    }
+    // replaced 僵尸守卫：被替换身份不得更新工作（含把 stale 拉回 active）
+    const workAgent = db.prepare(`SELECT status FROM agents WHERE id = ?`).get(work.agent_id);
+    if (workAgent && workAgent.status === 'replaced') return fail('该身份已被替换（replaced 终态），不可更新工作');
+
+    const updates = [];
+    const params = [];
+    if (progress !== undefined && progress !== null) {
+      const p = parseInt(progress, 10);
+      if (isNaN(p) || p < 0 || p > 100) return fail(`progress 必须是 0-100 整数（收到: ${progress}）`);
+      if (work.source !== 'external') return fail('hub 工作项不接收 progress（显示任务状态时间线，不伪造百分比）');
+      updates.push('progress = ?'); params.push(p);
+    }
+    if (note !== undefined && note !== null) {
+      updates.push('note = ?'); params.push(String(note));
+    }
+    if (!updates.length) return fail('无可更新字段（progress/note 至少其一）');
+
+    // stale 项借此拉回 active（agent 复活语义）
+    updates.push("status = 'active'", 'updated_at = ?');
+    params.push(now(), work_id);
+    db.prepare(`UPDATE agent_work SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+    const row = db.prepare(`SELECT * FROM agent_work WHERE id = ?`).get(work_id);
+    emitWorkEvent('work_updated', row);
+    return { work_id, status: row.status, progress: row.progress };
+  },
+
+  // POST /api/work/:work_id/finish {from_id, note?}
+  work_finish({ work_id, from_id, note }) {
+    const work = db.prepare(`SELECT * FROM agent_work WHERE id = ?`).get(work_id);
+    if (!work) return fail('work 不存在');
+
+    const actor = from_id ? db.prepare(`SELECT id, role FROM agents WHERE id = ?`).get(from_id) : null;
+    if (!actor) return fail('需要 from_id（操作者身份）');
+    if (from_id !== work.agent_id && actor.role !== 'manager') {
+      return fail('越权：只有 agent 本人或 manager 可以结束该工作');
+    }
+    if (work.status === 'done') return { work_id, status: 'done', already: true };
+
+    db.prepare(
+      `UPDATE agent_work SET status = 'done', finished_at = ?, updated_at = ?, note = COALESCE(?, note) WHERE id = ?`
+    ).run(now(), now(), note != null ? String(note) : null, work_id);
+    const row = db.prepare(`SELECT * FROM agent_work WHERE id = ?`).get(work_id);
+    emitWorkEvent('work_finished', row);
+    log('info', `agent_work: work finished`, { work_id, agent_id: work.agent_id, source: work.source });
+    return { work_id, status: 'done' };
+  },
+
+  // GET /api/works?project=&agent_id=&include_done=  /  GET /api/agents/:id/work
+  // dashboard 聚合用（避免 N+1）；include_done=false 时仅返回 active/stale
+  get_works({ project, agent_id, include_done }) {
+    let sql = `SELECT * FROM agent_work WHERE 1=1`;
+    const params = [];
+    if (project) { sql += ` AND project = ?`; params.push(project); }
+    if (agent_id) { sql += ` AND agent_id = ?`; params.push(agent_id); }
+    if (!include_done || include_done === 'false' || include_done === '0') {
+      sql += ` AND status != 'done'`;
+    }
+    sql += ` ORDER BY updated_at DESC LIMIT 500`;
+    return { works: db.prepare(sql).all(...params) };
   }
 };
 
@@ -1158,7 +1396,7 @@ app.get('/health', (req, res) => {
     epics: db.prepare(`SELECT COUNT(*) as c FROM epics`).get().c,
     projects: db.prepare(`SELECT COUNT(DISTINCT project) as c FROM agents WHERE status = 'online'`).get().c
   };
-  res.json(ok({ status: 'running', version: '2.2.0', uptime: process.uptime(), ...counts }));
+  res.json(ok({ status: 'running', version: '2.3.0', uptime: process.uptime(), ...counts }));
 });
 
 // MCP 协议: 列出工具
@@ -1213,6 +1451,9 @@ app.get('/api/messages/:agent_id', authMiddleware, (req, res) => {
     db.prepare(
       `UPDATE agents SET last_seen = ?, status = CASE WHEN status = 'replaced' THEN status ELSE 'online' END WHERE id = ?`
     ).run(now(), agentId);
+    // v2.3：轮询复活（offline→online）时拉回 stale 工作项；replaced 墓碑身份不拉回（身份未复活）
+    const wasRevived = db.prepare(`SELECT status FROM agents WHERE id = ?`).get(agentId);
+    if (wasRevived && wasRevived.status === 'online') reviveStaleWorks(agentId);
     const all = req.query.all === 'true';
 
     // 向后兼容：无 wait 参数，走原有同步逻辑
@@ -1541,6 +1782,53 @@ app.post('/api/offline/:agent_id', authMiddleware, (req, res) => {
   catch (err) { res.status(500).json(fail(err.message)); }
 });
 
+// ============ v2.3 外部任务上报路由（任务 933e16a3）============
+
+// POST /api/agents/:id/work/start {from_id, title, note?, ref?}
+app.post('/api/agents/:agent_id/work/start', authMiddleware, (req, res) => {
+  try {
+    const result = tools.work_start({ agent_id: req.params.agent_id, ...req.body });
+    res.json(result.error ? result : ok(result));
+  }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// POST /api/work/:work_id/update {from_id, progress?, note?}
+app.post('/api/work/:work_id/update', authMiddleware, (req, res) => {
+  try {
+    const result = tools.work_update({ work_id: req.params.work_id, ...req.body });
+    res.json(result.error ? result : ok(result));
+  }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// POST /api/work/:work_id/finish {from_id, note?}
+app.post('/api/work/:work_id/finish', authMiddleware, (req, res) => {
+  try {
+    const result = tools.work_finish({ work_id: req.params.work_id, ...req.body });
+    res.json(result.error ? result : ok(result));
+  }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// GET /api/works?project=&agent_id=&include_done=true —— 批量查询（dashboard 聚合用）
+app.get('/api/works', authMiddleware, (req, res) => {
+  try { res.json(ok(tools.get_works(req.query))); }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// GET /api/agents/:id/work —— 单 agent 查询（含 done，倒序）
+app.get('/api/agents/:agent_id/work', authMiddleware, (req, res) => {
+  try {
+    res.json(ok(tools.get_works({
+      agent_id: req.params.agent_id,
+      project: req.query.project || undefined,
+      include_done: req.query.include_done !== undefined ? req.query.include_done : true
+    })));
+  }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
 // v2 新增: 心跳路由
 app.post('/api/heartbeat', authMiddleware, (req, res) => {
   try { res.json(ok(tools.heartbeat(req.body))); }
@@ -1564,12 +1852,27 @@ setInterval(() => {
   // v2.1 身份机制：不碰 replaced 墓碑（终态），只把真超时的 online 置 offline
   db.prepare(`UPDATE agents SET status = 'offline', offline_at = ? WHERE status = 'online' AND last_seen < ?`)
     .run(now(), cutoff);
+
+  // v2.3 失联判定（任务 933e16a3，顺带处理不新建定时器）：
+  //   active 工作项 且所属 agent 已 offline 且 updated_at 超过30分钟 → 置 'stale'；
+  //   该 agent 心跳复活或 update 上报时自动拉回 active（见 heartbeat / work_update / 拉消息路径）。
+  const workCutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const orphaned = db.prepare(
+    `UPDATE agent_work SET status = 'stale', updated_at = ?
+     WHERE status = 'active'
+       AND agent_id IN (SELECT id FROM agents WHERE status IN ('offline','replaced'))
+       AND updated_at < ?`
+  ).run(now(), workCutoff);
+  if (orphaned.changes > 0) {
+    log('info', `agent_work: stale check marked ${orphaned.changes} work item(s) stale`);
+  }
+
   log('debug', 'Heartbeat check completed');
 }, 60 * 1000);
 
 // ---------- 启动 ----------
 app.listen(PORT, '0.0.0.0', () => {
-  log('info', `Agent Hub v2.2.0 running on port ${PORT}`);
+  log('info', `Agent Hub v2.3.0 running on port ${PORT}`);
   log('info', `Health: http://localhost:${PORT}/health`);
   log('info', `MCP Tools: http://localhost:${PORT}/mcp/tools`);
   log('info', `State Machine: http://localhost:${PORT}/api/state-machine`);
