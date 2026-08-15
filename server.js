@@ -1322,6 +1322,8 @@ const tools = {
     // replaced 僵尸守卫：被替换身份不得更新工作（含把 stale 拉回 active）
     const workAgent = db.prepare(`SELECT status FROM agents WHERE id = ?`).get(work.agent_id);
     if (workAgent && workAgent.status === 'replaced') return fail('该身份已被替换（replaced 终态），不可更新工作');
+    // done 是终态：不可再改（note/progress 都不行，防止完成后倒灌状态）
+    if (work.status === 'done') return fail('该工作已完成（done 终态），不可更新');
 
     const updates = [];
     const params = [];
