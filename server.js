@@ -215,6 +215,14 @@ db.exec(`
     updated_at  TEXT DEFAULT (datetime('now'))
   );
   CREATE INDEX IF NOT EXISTS idx_req_project ON requirements(project);
+  CREATE TABLE IF NOT EXISTS requirement_tasks (          -- v2.5.1 需求↔任务多对多关联
+    req_id  TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    sort_order INTEGER DEFAULT 0,
+    added_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (req_id, task_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_reqtask_task ON requirement_tasks(task_id);
 `);
 
 // ---------- 工具函数 ----------
@@ -754,10 +762,37 @@ const MCP_TOOLS = [
         title: { type: 'string' },
         description: { type: 'string' },
         task_id: { type: 'string', description: '可选，关联的hub任务ID（侧栏显示该任务实时状态）' },
+        task_ids: { type: 'array', items: { type: 'string' }, description: '可选，批量关联多个hub任务ID（点击需求展开显示任务明细）' },
         sort_order: { type: 'number', description: '排序权重，小的在前' },
         from_id: { type: 'string', description: 'PM的agent_id（必须是manager角色）' }
       },
       required: ['project', 'title', 'from_id']
+    }
+  },
+  {
+    name: 'req_link_tasks',
+    description: '【PM专用】给需求批量关联hub任务（多对多）。关联后监控面板点击该需求可展开看到每个任务的实时状态明细。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        req_id: { type: 'string' },
+        task_ids: { type: 'array', items: { type: 'string' }, description: 'hub任务ID数组' },
+        from_id: { type: 'string', description: 'PM的agent_id（必须是manager角色）' }
+      },
+      required: ['req_id', 'task_ids', 'from_id']
+    }
+  },
+  {
+    name: 'req_unlink_task',
+    description: '【PM专用】解除需求与某个hub任务的关联。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        req_id: { type: 'string' },
+        task_id: { type: 'string' },
+        from_id: { type: 'string', description: 'PM的agent_id（必须是manager角色）' }
+      },
+      required: ['req_id', 'task_id', 'from_id']
     }
   },
   {
@@ -1282,8 +1317,37 @@ const tools = {
       `INSERT INTO requirements (id, project, title, description, progress, task_id, sort_order, created_by, created_at, updated_at)
        VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`
     ).run(id, project, title, description || '', task_id || null, sort_order || 0, from_id || null, now(), now());
+    // v2.5.1 批量关联任务
+    const taskIds = Array.isArray(task_ids) ? task_ids.filter(Boolean) : [];
+    for (const tid of taskIds) {
+      if (tid === task_id) continue;
+      db.prepare(`INSERT OR IGNORE INTO requirement_tasks (req_id, task_id) VALUES (?, ?)`).run(id, tid);
+    }
     log('info', `Requirement added`, { req_id: id, title, project });
     return { req_id: id };
+  },
+
+  req_link_tasks({ req_id, task_ids, from_id }) {
+    const actor = from_id ? db.prepare(`SELECT role FROM agents WHERE id = ?`).get(from_id) : null;
+    if (!actor || actor.role !== 'manager') return fail(`权限不足：需求清单仅 PM(manager) 可维护`);
+    const row = db.prepare(`SELECT id FROM requirements WHERE id = ?`).get(req_id);
+    if (!row) return fail('需求不存在');
+    let n = 0;
+    for (const tid of (Array.isArray(task_ids) ? task_ids : []).filter(Boolean)) {
+      const t = db.prepare(`SELECT id FROM tasks WHERE id = ?`).get(tid);
+      if (!t) continue; // 静默跳过不存在的任务，幂等
+      n += db.prepare(`INSERT OR IGNORE INTO requirement_tasks (req_id, task_id) VALUES (?, ?)`).run(req_id, tid).changes;
+    }
+    db.prepare(`UPDATE requirements SET updated_at = ? WHERE id = ?`).run(now(), req_id);
+    return { req_id, linked: n };
+  },
+
+  req_unlink_task({ req_id, task_id, from_id }) {
+    const actor = from_id ? db.prepare(`SELECT role FROM agents WHERE id = ?`).get(from_id) : null;
+    if (!actor || actor.role !== 'manager') return fail(`权限不足：需求清单仅 PM(manager) 可维护`);
+    const r = db.prepare(`DELETE FROM requirement_tasks WHERE req_id = ? AND task_id = ?`).run(req_id, task_id);
+    if (!r.changes) return fail('关联不存在');
+    return { req_id, unlinked: task_id };
   },
 
   req_update({ req_id, title, description, progress, task_id, sort_order, from_id }) {
@@ -1310,6 +1374,7 @@ const tools = {
   req_delete({ req_id, from_id }) {
     const actor = from_id ? db.prepare(`SELECT role FROM agents WHERE id = ?`).get(from_id) : null;
     if (!actor || actor.role !== 'manager') return fail(`权限不足：需求清单仅 PM(manager) 可维护`);
+    db.prepare(`DELETE FROM requirement_tasks WHERE req_id = ?`).run(req_id);
     const r = db.prepare(`DELETE FROM requirements WHERE id = ?`).run(req_id);
     if (!r.changes) return fail('需求不存在');
     log('info', `Requirement deleted`, { req_id });
@@ -1325,8 +1390,14 @@ const tools = {
        ORDER BY r.sort_order ASC, r.created_at ASC`
     ).all(project || '');
     // status 派生：0=未开始 / 1-99=开发中 / 100=已完成
+    const stmtTasks = db.prepare(
+      `SELECT rt.task_id, t.title AS task_title, t.status AS task_status, t.task_type, t.updated_at
+       FROM requirement_tasks rt LEFT JOIN tasks t ON t.id = rt.task_id
+       WHERE rt.req_id = ? ORDER BY rt.sort_order ASC, rt.added_at ASC`
+    );
     for (const row of rows) {
       row.status = row.progress >= 100 ? 'done' : row.progress > 0 ? 'doing' : 'todo';
+      row.tasks = stmtTasks.all(row.id); // v2.5.1 关联任务明细（含已删除任务的悬空引用，前端跳转时兜底）
     }
     return { requirements: rows };
   },
@@ -1855,6 +1926,17 @@ app.put('/api/requirements/:req_id', authMiddleware, (req, res) => {
 
 app.delete('/api/requirements/:req_id', authMiddleware, (req, res) => {
   try { res.json(ok(tools.req_delete({ req_id: req.params.req_id, from_id: req.body.from_id }))); }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// v2.5.1 需求↔任务多对多关联
+app.post('/api/requirements/:req_id/tasks', authMiddleware, (req, res) => {
+  try { res.json(ok(tools.req_link_tasks({ req_id: req.params.req_id, ...req.body }))); }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+app.delete('/api/requirements/:req_id/tasks/:task_id', authMiddleware, (req, res) => {
+  try { res.json(ok(tools.req_unlink_task({ req_id: req.params.req_id, task_id: req.params.task_id, from_id: req.body.from_id }))); }
   catch (err) { res.status(500).json(fail(err.message)); }
 });
 
