@@ -200,6 +200,23 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_work_hub_task ON agent_work(hub_task_id);
 `);
 
+// v2.5 需求清单表（监控面板「项目进度」侧栏）：progress 仅 PM(manager) 可改，status 由 progress 实时派生
+db.exec(`
+  CREATE TABLE IF NOT EXISTS requirements (
+    id          TEXT PRIMARY KEY,
+    project     TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    progress    INTEGER NOT NULL DEFAULT 0,          -- 0-100，PM 维护
+    task_id     TEXT DEFAULT NULL,                   -- 可选关联 hub 任务（显示实时任务状态）
+    sort_order  INTEGER DEFAULT 0,
+    created_by  TEXT DEFAULT NULL,
+    created_at  TEXT DEFAULT (datetime('now')),
+    updated_at  TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_req_project ON requirements(project);
+`);
+
 // ---------- 工具函数 ----------
 function now() { return new Date().toISOString(); }
 
@@ -728,6 +745,62 @@ const MCP_TOOLS = [
     }
   },
   {
+    name: 'req_add',
+    description: '【PM专用】向项目进度需求清单添加一条开发需求（监控面板右侧「项目进度」栏展示）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string' },
+        title: { type: 'string' },
+        description: { type: 'string' },
+        task_id: { type: 'string', description: '可选，关联的hub任务ID（侧栏显示该任务实时状态）' },
+        sort_order: { type: 'number', description: '排序权重，小的在前' },
+        from_id: { type: 'string', description: 'PM的agent_id（必须是manager角色）' }
+      },
+      required: ['project', 'title', 'from_id']
+    }
+  },
+  {
+    name: 'req_update',
+    description: '【PM专用】更新需求（改进度/标题/关联任务）。progress 0-100：0=未开始，1-99=开发中，100=已完成（状态自动派生）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        req_id: { type: 'string' },
+        title: { type: 'string' },
+        description: { type: 'string' },
+        progress: { type: 'number', description: '0-100' },
+        task_id: { type: 'string' },
+        sort_order: { type: 'number' },
+        from_id: { type: 'string', description: 'PM的agent_id（必须是manager角色）' }
+      },
+      required: ['req_id', 'from_id']
+    }
+  },
+  {
+    name: 'req_delete',
+    description: '【PM专用】删除需求清单中的一条需求。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        req_id: { type: 'string' },
+        from_id: { type: 'string', description: 'PM的agent_id（必须是manager角色）' }
+      },
+      required: ['req_id', 'from_id']
+    }
+  },
+  {
+    name: 'list_requirements',
+    description: '查询需求清单（含派生状态与关联任务实时状态）。progress 仅 PM 可改。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string' }
+      },
+      required: ['project']
+    }
+  },
+  {
     name: 'get_task_events',
     description: '获取任务的状态流转历史（审计日志）。',
     inputSchema: {
@@ -1195,6 +1268,67 @@ const tools = {
 
     log('info', `Epic created`, { epic_id: epicId, title });
     return { epic_id: epicId };
+  },
+
+  // v2.5 需求清单（监控面板「项目进度」侧栏）：progress 仅 manager 可写，status 由 progress 实时派生
+  //   派生规则：0=未开始 / 1-99=开发中 / 100=已完成
+  req_add({ project, title, description = '', task_id = null, sort_order = 0, from_id }) {
+    const actor = from_id ? db.prepare(`SELECT role FROM agents WHERE id = ?`).get(from_id) : null;
+    if (!actor || actor.role !== 'manager') return fail(`权限不足：需求清单仅 PM(manager) 可维护`);
+    if (!project || !title) return fail('project 和 title 必填');
+
+    const id = uuidv4();
+    db.prepare(
+      `INSERT INTO requirements (id, project, title, description, progress, task_id, sort_order, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`
+    ).run(id, project, title, description || '', task_id || null, sort_order || 0, from_id || null, now(), now());
+    log('info', `Requirement added`, { req_id: id, title, project });
+    return { req_id: id };
+  },
+
+  req_update({ req_id, title, description, progress, task_id, sort_order, from_id }) {
+    const actor = from_id ? db.prepare(`SELECT role FROM agents WHERE id = ?`).get(from_id) : null;
+    if (!actor || actor.role !== 'manager') return fail(`权限不足：需求进度仅 PM(manager) 可修改`);
+    const row = db.prepare(`SELECT * FROM requirements WHERE id = ?`).get(req_id);
+    if (!row) return fail('需求不存在');
+
+    const p = progress === undefined || progress === null ? row.progress : Math.max(0, Math.min(100, parseInt(progress, 10) || 0));
+    db.prepare(
+      `UPDATE requirements SET title = ?, description = ?, progress = ?, task_id = ?, sort_order = ?, updated_at = ? WHERE id = ?`
+    ).run(
+      title !== undefined ? title : row.title,
+      description !== undefined ? description : row.description,
+      p,
+      task_id !== undefined ? task_id : row.task_id,
+      sort_order !== undefined ? sort_order : row.sort_order,
+      now(), req_id
+    );
+    log('info', `Requirement updated`, { req_id, progress: p });
+    return { req_id, progress: p };
+  },
+
+  req_delete({ req_id, from_id }) {
+    const actor = from_id ? db.prepare(`SELECT role FROM agents WHERE id = ?`).get(from_id) : null;
+    if (!actor || actor.role !== 'manager') return fail(`权限不足：需求清单仅 PM(manager) 可维护`);
+    const r = db.prepare(`DELETE FROM requirements WHERE id = ?`).run(req_id);
+    if (!r.changes) return fail('需求不存在');
+    log('info', `Requirement deleted`, { req_id });
+    return { deleted: req_id };
+  },
+
+  list_requirements({ project }) {
+    const rows = db.prepare(
+      `SELECT r.*, t.title AS task_title, t.status AS task_status
+       FROM requirements r
+       LEFT JOIN tasks t ON t.id = r.task_id
+       WHERE r.project = ?
+       ORDER BY r.sort_order ASC, r.created_at ASC`
+    ).all(project || '');
+    // status 派生：0=未开始 / 1-99=开发中 / 100=已完成
+    for (const row of rows) {
+      row.status = row.progress >= 100 ? 'done' : row.progress > 0 ? 'doing' : 'todo';
+    }
+    return { requirements: rows };
   },
 
   // v2 新增: 获取任务事件
@@ -1700,6 +1834,27 @@ app.get('/api/epics', authMiddleware, (req, res) => {
     const rows = db.prepare(sql).all(...params);
     res.json(ok({ epics: rows }));
   }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// v2.5 需求清单路由（监控面板「项目进度」侧栏数据源）
+app.get('/api/requirements', authMiddleware, (req, res) => {
+  try { res.json(ok(tools.list_requirements({ project: req.query.project }))); }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+app.post('/api/requirements', authMiddleware, (req, res) => {
+  try { res.json(ok(tools.req_add(req.body))); }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+app.put('/api/requirements/:req_id', authMiddleware, (req, res) => {
+  try { res.json(ok(tools.req_update({ req_id: req.params.req_id, ...req.body }))); }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+app.delete('/api/requirements/:req_id', authMiddleware, (req, res) => {
+  try { res.json(ok(tools.req_delete({ req_id: req.params.req_id, from_id: req.body.from_id }))); }
   catch (err) { res.status(500).json(fail(err.message)); }
 });
 
