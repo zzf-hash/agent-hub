@@ -225,6 +225,17 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_reqtask_task ON requirement_tasks(task_id);
 `);
 
+// v2.6 项目注册表（多项目支持）：key=英文标识，name=中文显示名
+db.exec(`
+  CREATE TABLE IF NOT EXISTS projects (
+    key         TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    created_by  TEXT DEFAULT NULL,
+    created_at  TEXT DEFAULT (datetime('now'))
+  );
+`);
+
 // ---------- 工具函数 ----------
 function now() { return new Date().toISOString(); }
 
@@ -1904,6 +1915,47 @@ app.get('/api/epics', authMiddleware, (req, res) => {
     sql += ` ORDER BY created_at DESC`;
     const rows = db.prepare(sql).all(...params);
     res.json(ok({ epics: rows }));
+  }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// v2.6 项目注册路由
+// 注册项目（幂等：key 已存在则更新 name/description 并标记 existed:true）
+app.post('/api/projects', authMiddleware, (req, res) => {
+  try {
+    const key = (req.body.key || '').trim();
+    const name = (req.body.name || key).trim();
+    if (!/^[a-z][a-z0-9_-]{1,31}$/i.test(key)) {
+      return res.status(400).json(fail('项目 key 必须是 2-32 位字母开头的英文标识（字母/数字/-/_）'));
+    }
+    const existed = !!db.prepare(`SELECT 1 FROM projects WHERE key = ?`).get(key);
+    db.prepare(`INSERT INTO projects (key, name, description, created_by) VALUES (?, ?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET name = excluded.name, description = excluded.description`)
+      .run(key, name, req.body.description || '', req.body.from_id || req.body.created_by || null);
+    res.json(ok({ key, name, existed }));
+  }
+  catch (err) { res.status(500).json(fail(err.message)); }
+});
+
+// 项目列表（含实时统计：agent 数 / 在线数 / 各状态任务数；未注册但有数据的项目也列出，标 unregistered:true）
+app.get('/api/projects', authMiddleware, (req, res) => {
+  try {
+    const registered = db.prepare(`SELECT * FROM projects ORDER BY created_at ASC`).all();
+    const regMap = new Map(registered.map(p => [p.key, { ...p, agents: 0, online: 0, tasks: 0, activeTasks: 0, unregistered: false }]));
+    // 聚合 agents（排除 replaced 墓碑）
+    for (const r of db.prepare(`SELECT project, COUNT(*) n, SUM(CASE WHEN status='online' THEN 1 ELSE 0 END) onl
+                                FROM agents WHERE status != 'replaced' GROUP BY project`).all()) {
+      if (!regMap.has(r.project)) regMap.set(r.project, { key: r.project, name: r.project, description: '', created_at: null, created_by: null, agents: 0, online: 0, tasks: 0, activeTasks: 0, unregistered: true });
+      const e = regMap.get(r.project); e.agents = r.n; e.online = r.onl || 0;
+    }
+    // 聚合任务
+    for (const r of db.prepare(`SELECT project, COUNT(*) n,
+                                SUM(CASE WHEN status IN ('pending','in_progress','in_review','testing') THEN 1 ELSE 0 END) act
+                                FROM tasks GROUP BY project`).all()) {
+      if (!regMap.has(r.project)) regMap.set(r.project, { key: r.project, name: r.project, description: '', created_at: null, created_by: null, agents: 0, online: 0, tasks: 0, activeTasks: 0, unregistered: true });
+      const e = regMap.get(r.project); e.tasks = r.n; e.activeTasks = r.act || 0;
+    }
+    res.json(ok({ projects: [...regMap.values()] }));
   }
   catch (err) { res.status(500).json(fail(err.message)); }
 });
